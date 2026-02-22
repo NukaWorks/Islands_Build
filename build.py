@@ -15,6 +15,9 @@ Usage examples
   python build.py clean                              # wipe the output dir
   python build.py status                             # show project/artifact status
   python build.py info                               # show resolved paths
+  python build.py idea                               # generate IntelliJ IDEA project files
+  python build.py idea --force                       # overwrite existing .iml files
+  python build.py idea --java-version 24.0.2-tem     # target a specific JDK in IDEA
   python build.py sdk list                           # list installed Java candidates
   python build.py sdk install 24.0.2-tem             # install a Java candidate
   python build.py sdk use 24.0.2-tem                 # switch default Java candidate
@@ -24,6 +27,9 @@ import argparse
 import os
 import sys
 import time
+import textwrap
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
 
 # ── make sure local modules are importable when run as a script ──────────────
 sys.path.insert(0, os.path.dirname(__file__))
@@ -226,6 +232,158 @@ def cmd_sdk_use(args: argparse.Namespace) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# idea command – generate IntelliJ IDEA monorepo project files
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pretty_xml(element: ET.Element) -> str:
+    """Return a pretty-printed XML string for the element."""
+    raw = ET.tostring(element, encoding="unicode")
+    dom = minidom.parseString(raw)
+    lines = dom.toprettyxml(indent="  ").splitlines()
+    # minidom adds an XML declaration on line 0; keep it
+    return "\n".join(lines) + "\n"
+
+
+def cmd_idea(args: argparse.Namespace) -> int:
+    """Generate / refresh IntelliJ IDEA .idea project files for the monorepo."""
+    log.banner("IDEA Project Setup", "Generating IntelliJ IDEA monorepo configuration")
+
+    idea_dir = cfg.WORKSPACE / ".idea"
+    idea_dir.mkdir(exist_ok=True)
+
+    java_ver = args.java_version or cfg.JAVA_VERSION or "24"
+    # Extract major version number only (e.g. "24.0.2-tem" → "24")
+    java_major = java_ver.split(".")[0].split("-")[0]
+    lang_level = f"JDK_{java_major}"
+
+    # ── modules.xml ──────────────────────────────────────────────────────────
+    # Each Maven project gets registered as a Maven module in IDEA
+    maven_modules = [
+        ("ModularKit",   cfg.MODULARKIT_DIR),
+        ("CoffeeLoader", cfg.COFFEELOADER_DIR),
+        ("Islands",      cfg.ISLANDS_DIR),
+    ]
+
+    project_el = ET.Element("project", version="4")
+    mgr = ET.SubElement(project_el, "component", name="ProjectModuleManager")
+    modules_el = ET.SubElement(mgr, "modules")
+
+    # Build module (Python)
+    build_iml = "$PROJECT_DIR$/Build/Build.iml"
+    ET.SubElement(modules_el, "module",
+                  fileurl=f"file://{build_iml}",
+                  filepath=build_iml)
+
+    # Root IDEA module
+    root_iml = "$PROJECT_DIR$/.idea/Islands.iml"
+    ET.SubElement(modules_el, "module",
+                  fileurl=f"file://{root_iml}",
+                  filepath=root_iml)
+
+    # Maven sub-projects
+    for name, project_dir in maven_modules:
+        rel = project_dir.relative_to(cfg.WORKSPACE)
+        iml_rel = f"$PROJECT_DIR$/{rel}/{name}.iml"
+        ET.SubElement(modules_el, "module",
+                      fileurl=f"file://{iml_rel}",
+                      filepath=iml_rel,
+                      group="Maven Projects")
+
+    modules_xml_path = idea_dir / "modules.xml"
+    modules_xml_path.write_text(_pretty_xml(project_el), encoding="utf-8")
+    log.success(f"Written: {modules_xml_path.relative_to(cfg.WORKSPACE)}")
+
+    # ── misc.xml ─────────────────────────────────────────────────────────────
+    misc_el = ET.Element("project", version="4")
+    ET.SubElement(misc_el, "component",
+                  name="Black",
+                  **{"option": ""})  # placeholder
+    # Rebuild without placeholder
+    misc_el = ET.Element("project", version="4")
+    black = ET.SubElement(misc_el, "component", name="Black")
+    opt = ET.SubElement(black, "option", name="sdkName")
+    opt.set("value", "Python 3.13")
+    root_mgr = ET.SubElement(misc_el, "component",
+                              name="ProjectRootManager",
+                              version="2",
+                              languageLevel=lang_level,
+                              **{"project-jdk-name": f"Java {java_major}",
+                                 "project-jdk-type": "JavaSDK"})
+    ET.SubElement(root_mgr, "output", url="file://$PROJECT_DIR$/out")
+
+    misc_xml_path = idea_dir / "misc.xml"
+    misc_xml_path.write_text(_pretty_xml(misc_el), encoding="utf-8")
+    log.success(f"Written: {misc_xml_path.relative_to(cfg.WORKSPACE)}")
+
+    # ── .iml files for each Maven sub-project ────────────────────────────────
+    for name, project_dir in maven_modules:
+        iml_path = project_dir / f"{name}.iml"
+        if iml_path.exists() and not args.force:
+            log.info(f"Skipping (already exists): {iml_path.relative_to(cfg.WORKSPACE)}")
+            continue
+        iml_el = ET.Element("module",
+                             type="JAVA_MODULE",
+                             version="4")
+        root_mgr_el = ET.SubElement(iml_el, "component",
+                                     name="NewModuleRootManager",
+                                     **{"inherit-compiler-output": "true"})
+        ET.SubElement(root_mgr_el, "exclude-output")
+        content = ET.SubElement(root_mgr_el, "content",
+                                 url="file://$MODULE_DIR$")
+        pom = project_dir / "pom.xml"
+        if pom.exists():
+            ET.SubElement(content, "excludeFolder",
+                          url="file://$MODULE_DIR$/target")
+        ET.SubElement(root_mgr_el, "orderEntry",
+                      type="inheritedJdk")
+        ET.SubElement(root_mgr_el, "orderEntry",
+                      type="sourceFolder", forTests="false")
+        iml_path.write_text(_pretty_xml(iml_el), encoding="utf-8")
+        log.success(f"Written: {iml_path.relative_to(cfg.WORKSPACE)}")
+
+    # ── vcs.xml ──────────────────────────────────────────────────────────────
+    vcs_path = idea_dir / "vcs.xml"
+    if not vcs_path.exists() or args.force:
+        vcs_el = ET.Element("project", version="4")
+        vcs_comp = ET.SubElement(vcs_el, "component", name="VcsDirectoryMappings")
+        ET.SubElement(vcs_comp, "mapping",
+                      directory="$PROJECT_DIR$",
+                      vcs="Git")
+        vcs_path.write_text(_pretty_xml(vcs_el), encoding="utf-8")
+        log.success(f"Written: {vcs_path.relative_to(cfg.WORKSPACE)}")
+
+    # ── encodings.xml ─────────────────────────────────────────────────────────
+    enc_path = idea_dir / "encodings.xml"
+    if not enc_path.exists() or args.force:
+        enc_el = ET.Element("project", version="4")
+        enc_comp = ET.SubElement(enc_el, "component",
+                                  name="Encoding",
+                                  addBOMForNewFiles=";UTF-8:with NO BOM",
+                                  defaultCharsetForPropertiesFiles="UTF-8")
+        enc_path.write_text(_pretty_xml(enc_el), encoding="utf-8")
+        log.success(f"Written: {enc_path.relative_to(cfg.WORKSPACE)}")
+
+    # ── compiler.xml ──────────────────────────────────────────────────────────
+    compiler_path = idea_dir / "compiler.xml"
+    comp_el = ET.Element("project", version="4")
+    compiler_comp = ET.SubElement(comp_el, "component", name="CompilerConfiguration")
+    ET.SubElement(compiler_comp, "bytecodeTargetLevel",
+                  **{"target": java_major})
+    compiler_path.write_text(_pretty_xml(comp_el), encoding="utf-8")
+    log.success(f"Written: {compiler_path.relative_to(cfg.WORKSPACE)}")
+
+    log.banner(
+        "Done",
+        textwrap.dedent(f"""\
+        Open the workspace root in IntelliJ IDEA:
+          File → Open → {cfg.WORKSPACE}
+        Then: File → Project Structure → Modules to verify all {len(maven_modules)} modules.
+        If prompted, import Maven projects from the pom.xml files in each module.""")
+    )
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI parser
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -311,6 +469,25 @@ def build_parser() -> argparse.ArgumentParser:
     # ── info ──────────────────────────────────────────────────────────────────
     p_info = sub.add_parser("info", help="Print resolved workspace paths and Java config")
     p_info.set_defaults(func=cmd_info)
+
+    # ── idea ──────────────────────────────────────────────────────────────────
+    p_idea = sub.add_parser(
+        "idea",
+        help="Generate / refresh IntelliJ IDEA .idea monorepo project files",
+        description=(
+            "Creates / updates .idea/modules.xml, .idea/misc.xml, .idea/compiler.xml,\n"
+            ".idea/vcs.xml, .idea/encodings.xml and a <Name>.iml for each Maven module,\n"
+            "so the workspace root can be opened as a single IDEA project containing\n"
+            "ModularKit, CoffeeLoader and Islands as module entries."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_idea.add_argument(
+        "--force", "-f", action="store_true",
+        help="Overwrite existing .iml and helper files (default: skip if present)",
+    )
+    _add_java_version_arg(p_idea)
+    p_idea.set_defaults(func=cmd_idea)
 
     # ── sdk ───────────────────────────────────────────────────────────────────
     p_sdk = sub.add_parser(

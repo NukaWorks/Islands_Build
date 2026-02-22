@@ -1,8 +1,9 @@
 """
 Maven build helpers.
 """
+import os
+import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -34,6 +35,12 @@ def run_maven(
         # batch-mode removes download progress spam; output still streams live
         cmd += ["--batch-mode"]
 
+    # Resolve mvn from the provided env's PATH so the right JDK is used
+    effective_env = env if env is not None else os.environ.copy()
+    mvn_bin = shutil.which("mvn", path=effective_env.get("PATH", os.environ.get("PATH", "")))
+    if mvn_bin:
+        cmd[0] = mvn_bin
+
     java_home = (env or {}).get("JAVA_HOME", "")
     java_tag = f"  [JAVA_HOME={java_home}]" if java_home else ""
     log.info(f"Running: {' '.join(cmd)}  (in {project_dir.name}){java_tag}")
@@ -41,7 +48,8 @@ def run_maven(
 
     try:
         # stdout/stderr are NOT captured — they go straight to the terminal
-        result = subprocess.run(cmd, cwd=project_dir, env=env)
+        # env=None means inherit the current process env (ambient PATH/JAVA_HOME)
+        result = subprocess.run(cmd, cwd=project_dir, env=env if env is not None else os.environ.copy())
     except FileNotFoundError:
         log.error("'mvn' not found – please install Apache Maven and add it to PATH.")
         return False
@@ -70,8 +78,8 @@ def build_project(
 ) -> bool:
     """Build a single Maven project and report the result."""
     log.section(f"Building  {name}")
-    goals = goals or ["clean", "install"]
-    ok = run_maven(project_dir, goals, skip_tests=skip_tests, verbose=verbose, env=env)
+    effective_goals: List[str] = goals if goals is not None else ["clean", "install"]
+    ok = run_maven(project_dir, effective_goals, skip_tests=skip_tests, verbose=verbose, env=env)
     if ok:
         log.success(f"{name} — build OK")
     else:
