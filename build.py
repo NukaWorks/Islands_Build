@@ -12,7 +12,9 @@ Usage examples
   python build.py build-all --mode devel             # strip GPG + append -nightly_<sha> version
   python build.py build-all --mode release           # full pom (GPG signing on)
   python build.py run-islands                        # build all + assemble + launch
-  python build.py run-islands --with-tests --no-clean --verbose
+  python build.py run-islands --fast-build            # skip build, assemble + launch existing artifacts
+  python build.py run-islands --clean                 # mvn clean install + wipe output dir before launch
+  python build.py run-islands --with-tests --clean --verbose
   python build.py run-islands --java-version 24.0.2-tem
   python build.py assemble                           # only assemble output dir (no build)
   python build.py clean                              # wipe the output dir
@@ -119,6 +121,7 @@ def cmd_build_all(args: argparse.Namespace) -> int:
             project["name"],
             project["dir"],
             skip_tests=skip_tests,
+            clean=getattr(args, "clean", False),
             verbose=args.verbose,
             env=env,
             pom_override=pom_override,
@@ -142,7 +145,9 @@ def cmd_run_islands(args: argparse.Namespace) -> int:
     """Build all projects then launch Islands via CoffeeLoader."""
     ok = runner.build_and_run_islands(
         skip_tests=not args.with_tests,
-        clean_output=not args.no_clean,
+        clean_output=args.clean,
+        fast_build=args.fast_build,
+        clean=args.clean,
         verbose=args.verbose,
         java_opts=args.java_opts,
         java_version=args.java_version,
@@ -154,7 +159,7 @@ def cmd_run_islands(args: argparse.Namespace) -> int:
 def cmd_assemble(args: argparse.Namespace) -> int:
     """Assemble the output directory without rebuilding (expects artifacts exist)."""
     log.banner("Assemble Output")
-    ok = runner._assemble_output(clean=not args.no_clean)
+    ok = runner._assemble_output(clean=args.clean)
     return 0 if ok else 1
 
 
@@ -1003,6 +1008,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_build.add_argument("--with-tests", action="store_true",
         help="Run unit tests during build (default: tests are skipped)")
+    p_build.add_argument("--clean", action="store_true",
+        help="Run 'mvn clean install' instead of 'mvn install' (default: no clean)")
     p_build.add_argument("--verbose", "-v", action="store_true",
         help="Show full Maven output (removes --batch-mode)")
     _add_java_version_arg(p_build)
@@ -1026,8 +1033,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_run.add_argument("--with-tests", action="store_true",
         help="Run unit tests during build")
-    p_run.add_argument("--no-clean", action="store_true",
-        help="Do not wipe the output directory before assembling")
+    p_run.add_argument("--fast-build", action="store_true", dest="fast_build",
+        help="Skip the Maven build entirely and go straight to assemble + launch "
+             "(uses whatever artifacts are already on disk)")
+    p_run.add_argument("--clean", action="store_true",
+        help="Run 'mvn clean install' and wipe the output directory before assembling "
+             "(default: 'mvn install' only, output directory is kept)")
     p_run.add_argument("--verbose", "-v", action="store_true",
         help="Show full Maven output")
     p_run.add_argument("--java-opts", metavar="OPTS", default=None,
@@ -1041,8 +1052,8 @@ def build_parser() -> argparse.ArgumentParser:
         "assemble",
         help="Copy built artifacts into output/ without rebuilding",
     )
-    p_asm.add_argument("--no-clean", action="store_true",
-        help="Keep existing output dir contents")
+    p_asm.add_argument("--clean", action="store_true",
+        help="Wipe the output directory before assembling (default: keep existing contents)")
     p_asm.set_defaults(func=cmd_assemble)
 
     # ── clean ─────────────────────────────────────────────────────────────────

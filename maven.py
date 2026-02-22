@@ -77,6 +77,7 @@ def build_project(
     *,
     goals: Optional[List[str]] = None,
     skip_tests: bool = False,
+    clean: bool = False,
     verbose: bool = False,
     env: Optional[Dict[str, str]] = None,
     pom_override: Optional[Path] = None,
@@ -84,7 +85,12 @@ def build_project(
 ) -> bool:
     """Build a single Maven project and report the result."""
     log.section(f"Building  {name}")
-    effective_goals: List[str] = goals if goals is not None else ["clean", "install"]
+    if goals is not None:
+        effective_goals: List[str] = goals
+    elif clean:
+        effective_goals = ["clean", "install"]
+    else:
+        effective_goals = ["install"]
     all_extra = list(extra_maven_args or [])
     ok = run_maven(
         project_dir,

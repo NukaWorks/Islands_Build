@@ -37,7 +37,7 @@ COFFEELOADER_DIR = WORKSPACE / "CoffeeLoader"
 ISLANDS_DIR     = WORKSPACE / "Islands"
 
 # ── Output / distribution ────────────────────────────────────────────────────
-OUTPUT_DIR  = BUILD_DIR / "output"
+OUTPUT_DIR  = WORKSPACE / "output"
 MODULES_DIR = OUTPUT_DIR / "modules"   # where Islands module JAR lands
 
 # ── Artifact names produced by Maven (finalName in pom.xml) ─────────────────
