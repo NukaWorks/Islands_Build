@@ -19,14 +19,18 @@ def run_maven(
     extra_args: Optional[List[str]] = None,
     verbose: bool = False,
     env: Optional[Dict[str, str]] = None,
+    pom_override: Optional[Path] = None,
 ) -> bool:
     """
     Run 'mvn <goals>' inside *project_dir*, streaming all output live.
     Pass *env* to override environment variables (e.g. JAVA_HOME).
+    Pass *pom_override* to use a different pom file (e.g. .buildconfig-pom.xml).
 
     Returns True on success, False on failure.
     """
     cmd = ["mvn"] + goals
+    if pom_override is not None:
+        cmd += ["-f", str(pom_override)]
     if skip_tests:
         cmd += ["-DskipTests"]
     if extra_args:
@@ -75,11 +79,22 @@ def build_project(
     skip_tests: bool = False,
     verbose: bool = False,
     env: Optional[Dict[str, str]] = None,
+    pom_override: Optional[Path] = None,
+    extra_maven_args: Optional[List[str]] = None,
 ) -> bool:
     """Build a single Maven project and report the result."""
     log.section(f"Building  {name}")
     effective_goals: List[str] = goals if goals is not None else ["clean", "install"]
-    ok = run_maven(project_dir, effective_goals, skip_tests=skip_tests, verbose=verbose, env=env)
+    all_extra = list(extra_maven_args or [])
+    ok = run_maven(
+        project_dir,
+        effective_goals,
+        skip_tests=skip_tests,
+        verbose=verbose,
+        env=env,
+        pom_override=pom_override,
+        extra_args=all_extra if all_extra else None,
+    )
     if ok:
         log.success(f"{name} — build OK")
     else:

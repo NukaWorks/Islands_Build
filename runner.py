@@ -14,6 +14,7 @@ from typing import Dict, Optional
 
 import config as cfg
 import fs
+import hooks as hooksmod
 import logger as log
 import maven
 import sdkman
@@ -60,6 +61,14 @@ def _check_artifact(project: dict) -> bool:
         log.warn(f"Expected artifact not found: {art}")
         return False
     return True
+
+
+def _resolve_hooks(project: dict) -> dict:
+    """Return the hooks dict for a project (supports lazy callable form)."""
+    hooks_entry = project.get("hooks", {})
+    if callable(hooks_entry):
+        return hooks_entry()
+    return hooks_entry or {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -142,18 +151,20 @@ def build_and_run_islands(
     verbose: bool = False,
     java_opts: Optional[str] = None,
     java_version: Optional[str] = None,
+    mode: Optional[str] = None,
 ) -> bool:
     """
     Full pipeline:
-      1. Build ModularKit
+      1. Build ModularKit  (with pre/post hooks)
       2. Build CoffeeLoader
       3. Build Islands
       4. Assemble output directory
       5. Launch CoffeeLoader (blocking – Ctrl+C to stop)
     """
+    effective_mode = mode or cfg.BUILD_MODE
     log.banner(
         "Build & Run Islands",
-        "ModularKit → CoffeeLoader → Islands  then launch",
+        f"ModularKit → CoffeeLoader → Islands  then launch  |  mode: {effective_mode}",
     )
 
     env = _resolve_env(java_version)
@@ -163,15 +174,35 @@ def build_and_run_islands(
     total = len(cfg.PROJECTS)
     for i, project in enumerate(cfg.PROJECTS, 1):
         log.step(i, total, project["name"])
+
+        # ── pre-build hooks ──────────────────────────────────────────────
+        hook_table = _resolve_hooks(project)
+        ctx = hooksmod.build_hook_context(project, mode=effective_mode, verbose=verbose)
+        ok, pom_override, extra_mvn_args = hooksmod.run_hooks(
+            "pre_build", hook_table.get("pre_build", []), ctx
+        )
+        if not ok:
+            log.error(f"Pre-build hook failed for: {project['name']}")
+            return False
+
+        # ── maven build ──────────────────────────────────────────────────
         ok = maven.build_project(
             project["name"],
             project["dir"],
             skip_tests=skip_tests,
             verbose=verbose,
             env=env,
+            pom_override=pom_override,
+            extra_maven_args=extra_mvn_args,
         )
         if not ok:
             log.error(f"Build pipeline aborted at: {project['name']}")
+            return False
+
+        # ── post-build hooks ─────────────────────────────────────────────
+        ok, _, _ = hooksmod.run_hooks("post_build", hook_table.get("post_build", []), ctx)
+        if not ok:
+            log.error(f"Post-build hook failed for: {project['name']}")
             return False
 
     if not _assemble_output(clean=clean_output):
