@@ -14,7 +14,9 @@ Usage examples
   python build.py build-all --mode release           # full pom (GPG signing on)
   python build.py run                                # build all + assemble + launch
   python build.py run --fast-build                   # skip build, assemble + launch existing artifacts
-  python build.py run --clean                        # mvn clean install + wipe output dir before launch
+  python build.py run --clean                        # force full rebuild + wipe output dir before launch
+  python build.py run --watch                        # build + launch + watch for changes (hot-swap)
+  python build.py run --watch --poll-interval 1.0    # watch with 1 s scan interval
   python build.py run --with-tests --clean --verbose
   python build.py run --java-version 24.0.2-tem
   python build.py assemble                           # only assemble output dir (no build)
@@ -80,6 +82,7 @@ import maven
 import repotool
 import runner
 import sdkman
+import watcher as watchermod
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -196,17 +199,32 @@ def cmd_build_all(args: argparse.Namespace) -> int:
 
 def cmd_run_islands(args: argparse.Namespace) -> int:
     """Build all projects then launch Islands via CoffeeLoader."""
-    ok = runner.build_and_run_islands(
-        skip_tests=not args.with_tests,
-        clean_output=args.clean,
-        fast_build=args.fast_build,
-        clean=args.clean,
-        verbose=args.verbose,
-        java_opts=args.java_opts,
-        java_version=args.java_version,
-        mode=getattr(args, "mode", None) or cfg.BUILD_MODE,
-        cache_dir=cfg.BUILD_DIR / ".build-cache",
-    )
+    cache_dir = cfg.BUILD_DIR / ".build-cache"
+    mode      = getattr(args, "mode", None) or cfg.BUILD_MODE
+
+    if getattr(args, "watch", False):
+        ok = watchermod.watch_and_run(
+            skip_tests=not args.with_tests,
+            clean=args.clean,
+            verbose=args.verbose,
+            java_opts=args.java_opts,
+            java_version=args.java_version,
+            mode=mode,
+            cache_dir=cache_dir,
+            poll_interval=args.poll_interval,
+        )
+    else:
+        ok = runner.build_and_run_islands(
+            skip_tests=not args.with_tests,
+            clean_output=args.clean,
+            fast_build=args.fast_build,
+            clean=args.clean,
+            verbose=args.verbose,
+            java_opts=args.java_opts,
+            java_version=args.java_version,
+            mode=mode,
+            cache_dir=cache_dir,
+        )
     return 0 if ok else 1
 
 
@@ -1241,12 +1259,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Build all, assemble output dir, then launch Islands via CoffeeLoader",
         description=(
             "Full pipeline:\n"
-            "  1. mvn clean install  ModularKit\n"
-            "  2. mvn clean install  CoffeeLoader\n"
-            "  3. mvn clean install  Islands\n"
+            "  1. mvn install  ModularKit   (skipped if up-to-date)\n"
+            "  2. mvn install  CoffeeLoader (skipped if up-to-date)\n"
+            "  3. mvn install  Islands      (skipped if up-to-date)\n"
             "  4. Assemble output/ directory\n"
             "  5. Write CoffeeLoader config.json  (sources -> output/modules/)\n"
             "  6. java -jar CoffeeLoader          (blocks until Ctrl+C)\n"
+            "\n"
+            "With --watch:\n"
+            "  Steps 1-5 run as above, then the watcher loop monitors every\n"
+            "  project's src/ tree.  On change: incremental rebuild → re-assemble\n"
+            "  → CoffeeLoader hot-swaps the updated jars automatically.\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1254,10 +1277,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run unit tests during build")
     p_run.add_argument("--fast-build", action="store_true", dest="fast_build",
         help="Skip the Maven build entirely and go straight to assemble + launch "
-             "(uses whatever artifacts are already on disk)")
+             "(uses whatever artifacts are already on disk, incompatible with --watch)")
     p_run.add_argument("--clean", action="store_true",
-        help="Run 'mvn clean install' and wipe the output directory before assembling "
-             "(default: 'mvn install' only, output directory is kept)")
+        help="Force full rebuild, ignoring the hash cache, and wipe the output directory")
+    p_run.add_argument("--watch", "-w", action="store_true",
+        help="Watch source files for changes and incrementally rebuild without restarting "
+             "the JVM (CoffeeLoader hot-swaps updated jars via its fileWatcher)")
+    p_run.add_argument("--poll-interval", metavar="SECS", type=float, default=2.0,
+        dest="poll_interval",
+        help="Seconds between file-change scans in watch mode (default: 2.0)")
     p_run.add_argument("--verbose", "-v", action="store_true",
         help="Show full Maven output")
     p_run.add_argument("--java-opts", metavar="OPTS", default=None,

@@ -246,3 +246,31 @@ def clear_cache(cache_dir: Path) -> None:
     if cache_dir.exists():
         shutil.rmtree(cache_dir)
 
+
+def scan_changed(
+    projects: list,
+    all_manifests: "dict[str, ProjectManifest]",
+    mode: str,
+    cache_dir: Path,
+) -> list[str]:
+    """
+    Return the artifact IDs of every project whose source fingerprint
+    differs from the cached value (or has no cached value at all).
+
+    *projects* is the list returned by ``cfg.get_projects()``.
+    Does NOT check whether the artifact jar exists — that is intentionally
+    left to the caller so the watcher can distinguish "stale" from "missing".
+    """
+    stale: list[str] = []
+    for p in projects:
+        from hooks import ProjectManifest  # lazy
+        manifest = ProjectManifest.load(Path(p["dir"]))
+        if manifest is None:
+            continue
+        stored = _load_cached(manifest.artifact_id, cache_dir)
+        current = fingerprint(Path(p["dir"]), manifest, all_manifests, mode)
+        if stored != current:
+            stale.append(manifest.artifact_id)
+    return stale
+
+
