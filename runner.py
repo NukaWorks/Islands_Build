@@ -10,6 +10,7 @@ from typing import Dict, Optional
 
 import config as cfg
 import fs
+import hasher as hashermod
 import hooks as hooksmod
 import logger as log
 import maven
@@ -173,24 +174,25 @@ def build_and_run_islands(
     java_opts: Optional[str] = None,
     java_version: Optional[str] = None,
     mode: Optional[str] = None,
+    cache_dir: Optional[Path] = None,
 ) -> bool:
     """
     Full pipeline:
-      1. Build ModularKit  (with pre/post hooks)
-      2. Build CoffeeLoader
-      3. Build Islands
+      1. Build ModularKit  (with pre/post hooks, skipped if up-to-date)
+      2. Build CoffeeLoader (skipped if up-to-date)
+      3. Build Islands      (skipped if up-to-date)
       4. Assemble output directory
       5. Launch CoffeeLoader (blocking – Ctrl+C to stop)
 
-    Pass fast_build=True to skip the Maven build steps (steps 1–3) and go
-    straight to assemble + launch using whatever artifacts are already on disk.
-    Pass clean=True to run 'mvn clean install' instead of just 'mvn install'.
+    Pass fast_build=True to skip the Maven build steps (1-3) entirely.
+    Pass clean=True to force rebuild of everything (ignores hash cache).
     """
     effective_mode = mode or cfg.BUILD_MODE
+    effective_cache = cache_dir or (cfg.BUILD_DIR / ".build-cache")
     projects = cfg.get_projects()
     log.banner(
         "Build & Run Islands",
-        f"{len(projects)} project(s)  →  launch  |  mode: {effective_mode}",
+        f"{len(projects)} project(s)  →  launch  |  mode: {effective_mode}  |  force: {clean}",
     )
 
     env = _resolve_env(java_version)
@@ -200,11 +202,39 @@ def build_and_run_islands(
     if fast_build:
         log.info("--fast-build: skipping Maven build, using existing artifacts.")
     else:
+        # --clean wipes hash cache so everything rebuilds
+        if clean:
+            hashermod.clear_cache(effective_cache)
+            log.info("--clean: build cache cleared, all projects will rebuild.")
+
+        # Build manifest map once for fingerprinting
+        all_manifests: dict = {}
+        for p in projects:
+            m = hooksmod.ProjectManifest.load(Path(p["dir"]))
+            if m is not None:
+                all_manifests[m.artifact_id] = m
+
         total = len(projects)
         for i, project in enumerate(projects, 1):
             log.step(i, total, project["name"])
 
-            # ── pre-build hooks ──────────────────────────────────────────────
+            manifest = hooksmod.ProjectManifest.load(Path(project["dir"]))
+            artifact  = Path(project["artifact"]) if project.get("artifact") else None
+
+            # ── hash-diff check ──────────────────────────────────────────
+            if (
+                not clean
+                and manifest is not None
+                and artifact is not None
+                and hashermod.is_up_to_date(
+                    Path(project["dir"]), manifest, all_manifests,
+                    effective_mode, artifact, effective_cache,
+                )
+            ):
+                log.info(f"[{project['name']}] ✓ up-to-date — skipping")
+                continue
+
+            # ── pre-build hooks ──────────────────────────────────────────
             ctx = hooksmod.build_hook_context(project, mode=effective_mode,
                                               verbose=verbose, workspace_dir=cfg.WORKSPACE)
             ok, pom_override, extra_mvn_args = hooksmod.run_hooks(
@@ -216,7 +246,7 @@ def build_and_run_islands(
                 log.error(f"Pre-build hook failed for: {project['name']}")
                 return False
 
-            # ── maven build ──────────────────────────────────────────────────
+            # ── maven build ──────────────────────────────────────────────
             ok = maven.build_project(
                 project["name"],
                 project["dir"],
@@ -231,11 +261,23 @@ def build_and_run_islands(
                 log.error(f"Build pipeline aborted at: {project['name']}")
                 return False
 
-            # ── post-build hooks ─────────────────────────────────────────────
+            # ── post-build hooks ─────────────────────────────────────────
             ok, _, _ = hooksmod.run_hooks("post_build", [], ctx)
             if not ok:
                 log.error(f"Post-build hook failed for: {project['name']}")
                 return False
+
+            # ── update cache & cascade-invalidate dependents ─────────────
+            if manifest is not None:
+                hashermod.mark_built(
+                    Path(project["dir"]), manifest, all_manifests,
+                    effective_mode, effective_cache,
+                )
+                invalidated = hashermod.invalidate_dependents(
+                    manifest.artifact_id, all_manifests, effective_cache
+                )
+                if invalidated:
+                    log.info(f"  cache invalidated for: {', '.join(invalidated)}")
 
     if not _assemble_output(clean=clean_output):
         log.error("Failed to assemble output directory.")

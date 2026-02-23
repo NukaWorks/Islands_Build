@@ -5,8 +5,9 @@ Islands Build CLI
 
 Usage examples
 --------------
-  python build.py build-all                          # build every project (tests skipped)
+  python build.py build-all                          # build every project (unchanged projects skipped)
   python build.py build-all --with-tests             # build + run tests for every project
+  python build.py build-all --clean                  # force full rebuild (ignore hash cache)
   python build.py build-all --java-version 24.0.2-tem
   python build.py build-all --mode local             # strip GPG plugin (default on dev machines)
   python build.py build-all --mode devel             # strip GPG + append -nightly_<sha> version
@@ -18,6 +19,9 @@ Usage examples
   python build.py run --java-version 24.0.2-tem
   python build.py assemble                           # only assemble output dir (no build)
   python build.py clean                              # wipe the output dir
+  python build.py cache status                       # show hash-cache state for all projects
+  python build.py cache clear                        # wipe hash cache (forces full rebuild)
+  python build.py cache invalidate ModularKit        # mark one project as stale
   python build.py status                             # show project/artifact status
   python build.py info                               # show resolved paths + workspace projects
   python build.py idea                               # generate IntelliJ IDEA project files
@@ -69,6 +73,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import config as cfg
 import fs
 import git as gitutil
+import hasher as hashermod
 import hooks as hooksmod
 import logger as log
 import maven
@@ -87,26 +92,62 @@ def _universal_hooks() -> dict:
 
 
 def cmd_build_all(args: argparse.Namespace) -> int:
-    """Build every project in dependency order."""
+    """Build every project in dependency order, skipping unchanged projects."""
     skip_tests = not args.with_tests
     java_ver   = args.java_version or cfg.JAVA_VERSION
     mode       = getattr(args, "mode", None) or cfg.BUILD_MODE
+    force      = getattr(args, "clean", False)   # --clean forces full rebuild
     projects   = cfg.get_projects()
+    cache_dir  = cfg.BUILD_DIR / ".build-cache"
+
     log.banner(
         "Build All",
         f"Projects: {len(projects)}  |  "
         f"Tests: {'enabled' if args.with_tests else 'skipped'}  |  "
-        f"Java: {java_ver or 'ambient'}  |  Mode: {mode}  |  Verbose: {args.verbose}",
+        f"Java: {java_ver or 'ambient'}  |  Mode: {mode}  |  Verbose: {args.verbose}  |  "
+        f"Force: {force}",
     )
+
+    # --clean wipes the entire hash cache so every project rebuilds
+    if force:
+        hashermod.clear_cache(cache_dir)
+        log.info("--clean: build cache cleared, all projects will rebuild.")
+
     # Resolve env once so we fail early if Java is missing
     env = runner._resolve_env(java_ver)
     if env is None and java_ver:
         return 1
 
-    total = len(projects)
-    start = time.time()
+    # Build a full manifest map once (needed for fingerprinting dep versions)
+    all_manifests: dict = {}
+    for p in projects:
+        m = hooksmod.ProjectManifest.load(Path(p["dir"]))
+        if m is not None:
+            all_manifests[m.artifact_id] = m
+
+    total   = len(projects)
+    start   = time.time()
+    skipped = 0
+
     for i, project in enumerate(projects, 1):
         log.step(i, total, project["name"])
+
+        manifest = hooksmod.ProjectManifest.load(Path(project["dir"]))
+        artifact  = Path(project["artifact"]) if project.get("artifact") else None
+
+        # ── hash-diff check ──────────────────────────────────────────────
+        if (
+            not force
+            and manifest is not None
+            and artifact is not None
+            and hashermod.is_up_to_date(
+                Path(project["dir"]), manifest, all_manifests, mode,
+                artifact, cache_dir,
+            )
+        ):
+            log.info(f"[{project['name']}] ✓ up-to-date — skipping")
+            skipped += 1
+            continue
 
         # ── pre-build hooks ──────────────────────────────────────────────
         ctx = hooksmod.build_hook_context(project, mode=mode, verbose=args.verbose,
@@ -122,7 +163,7 @@ def cmd_build_all(args: argparse.Namespace) -> int:
             project["name"],
             project["dir"],
             skip_tests=skip_tests,
-            clean=getattr(args, "clean", False),
+            clean=force,
             verbose=args.verbose,
             env=env,
             pom_override=pom_override,
@@ -138,7 +179,18 @@ def cmd_build_all(args: argparse.Namespace) -> int:
             log.error(f"Post-build hook failed for: {project['name']}")
             return 1
 
-    log.success(f"All {total} projects built in {log.duration(time.time() - start)}.")
+        # ── update cache & cascade-invalidate dependents ─────────────────
+        if manifest is not None:
+            hashermod.mark_built(Path(project["dir"]), manifest, all_manifests, mode, cache_dir)
+            invalidated = hashermod.invalidate_dependents(manifest.artifact_id, all_manifests, cache_dir)
+            if invalidated:
+                log.info(f"  cache invalidated for: {', '.join(invalidated)}")
+
+    built = total - skipped
+    log.success(
+        f"Done in {log.duration(time.time() - start)} — "
+        f"built: {built}  skipped (up-to-date): {skipped}"
+    )
     return 0
 
 
@@ -153,6 +205,7 @@ def cmd_run_islands(args: argparse.Namespace) -> int:
         java_opts=args.java_opts,
         java_version=args.java_version,
         mode=getattr(args, "mode", None) or cfg.BUILD_MODE,
+        cache_dir=cfg.BUILD_DIR / ".build-cache",
     )
     return 0 if ok else 1
 
@@ -170,6 +223,83 @@ def cmd_clean(args: argparse.Namespace) -> int:
     fs.clean_output(cfg.OUTPUT_DIR)
     log.success(f"Output directory cleaned: {cfg.OUTPUT_DIR}")
     return 0
+
+
+def cmd_cache(args: argparse.Namespace) -> int:
+    """Manage the source-hash build cache."""
+    cache_dir = cfg.BUILD_DIR / ".build-cache"
+    sub = args.cache_command
+
+    if sub == "clear":
+        hashermod.clear_cache(cache_dir)
+        log.success("Build cache cleared — all projects will rebuild on next run.")
+        return 0
+
+    if sub == "status":
+        log.banner("Build Cache Status", str(cache_dir))
+        projects   = cfg.get_projects()
+        mode       = cfg.BUILD_MODE
+
+        # Build manifest map
+        all_manifests: dict = {}
+        for p in projects:
+            m = hooksmod.ProjectManifest.load(Path(p["dir"]))
+            if m is not None:
+                all_manifests[m.artifact_id] = m
+
+        rows = []
+        for p in projects:
+            manifest = hooksmod.ProjectManifest.load(Path(p["dir"]))
+            artifact  = Path(p["artifact"]) if p.get("artifact") else None
+            if manifest is None:
+                rows.append((p["name"], "—", "no project.json"))
+                continue
+            if artifact is None:
+                rows.append((p["name"], "—", "no artifact path"))
+                continue
+            up_to_date = hashermod.is_up_to_date(
+                Path(p["dir"]), manifest, all_manifests, mode, artifact, cache_dir
+            )
+            status = "✔ up-to-date" if up_to_date else "✖ stale / not cached"
+            rows.append((p["name"], artifact.name, status))
+
+        try:
+            from rich.table import Table
+            from rich.console import Console
+            table = Table(title="Hash Cache", show_lines=True)
+            table.add_column("Project",  style="bold cyan", no_wrap=True)
+            table.add_column("Artifact", style="dim")
+            table.add_column("Cache",    style="bold")
+            for name, art, status in rows:
+                colour = "green" if "up-to-date" in status else "red"
+                table.add_row(name, art, f"[{colour}]{status}[/{colour}]")
+            Console().print(table)
+        except ImportError:
+            print(f"\n{'Project':<16}  {'Artifact':<42}  Cache")
+            print("─" * 80)
+            for name, art, status in rows:
+                print(f"{name:<16}  {art:<42}  {status}")
+            print()
+        return 0
+
+    if sub == "invalidate":
+        target = args.project
+        projects = cfg.get_projects()
+        matched = [p for p in projects if p["name"].lower() == target.lower()]
+        if not matched:
+            names = ", ".join(p["name"] for p in projects)
+            log.error(f"Project '{target}' not found. Available: {names}")
+            return 1
+        m = hooksmod.ProjectManifest.load(Path(matched[0]["dir"]))
+        if m is None:
+            log.error(f"No project.json in {matched[0]['dir']}")
+            return 1
+        hashermod.invalidate(m.artifact_id, cache_dir)
+        log.success(f"Cache entry invalidated for '{m.name}' — will rebuild on next run.")
+        return 0
+
+    log.error(f"Unknown cache sub-command: {sub}")
+    return 1
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -1148,6 +1278,32 @@ def build_parser() -> argparse.ArgumentParser:
     # ── clean ─────────────────────────────────────────────────────────────────
     p_clean = sub.add_parser("clean", help="Delete the output/ directory")
     p_clean.set_defaults(func=cmd_clean)
+
+    # ── cache ─────────────────────────────────────────────────────────────────
+    p_cache = sub.add_parser(
+        "cache",
+        help="Manage the source-hash build cache (status / clear / invalidate)",
+        description=(
+            "Inspect or clear the source-hash cache used to skip unchanged projects.\n\n"
+            "Sub-commands:\n"
+            "  status               show cache state for every project\n"
+            "  clear                wipe the entire cache (all projects will rebuild)\n"
+            "  invalidate <PROJECT> force a specific project to rebuild next time\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    cache_sub = p_cache.add_subparsers(dest="cache_command", metavar="<cache-command>")
+    cache_sub.required = True
+
+    p_cache_status = cache_sub.add_parser("status", help="Show cache state for every project")
+    p_cache_status.set_defaults(func=cmd_cache)
+
+    p_cache_clear = cache_sub.add_parser("clear", help="Wipe the entire build cache")
+    p_cache_clear.set_defaults(func=cmd_cache)
+
+    p_cache_inv = cache_sub.add_parser("invalidate", help="Force a single project to rebuild")
+    p_cache_inv.add_argument("project", metavar="PROJECT")
+    p_cache_inv.set_defaults(func=cmd_cache)
 
     # ── status ────────────────────────────────────────────────────────────────
     p_status = sub.add_parser("status", help="Show build status of each Maven artifact")
