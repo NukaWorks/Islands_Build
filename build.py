@@ -12,14 +12,14 @@ Usage examples
   python build.py build-all --mode devel             # strip GPG + append -nightly_<sha> version
   python build.py build-all --mode release           # full pom (GPG signing on)
   python build.py run-islands                        # build all + assemble + launch
-  python build.py run-islands --fast-build            # skip build, assemble + launch existing artifacts
-  python build.py run-islands --clean                 # mvn clean install + wipe output dir before launch
+  python build.py run-islands --fast-build           # skip build, assemble + launch existing artifacts
+  python build.py run-islands --clean                # mvn clean install + wipe output dir before launch
   python build.py run-islands --with-tests --clean --verbose
   python build.py run-islands --java-version 24.0.2-tem
   python build.py assemble                           # only assemble output dir (no build)
   python build.py clean                              # wipe the output dir
   python build.py status                             # show project/artifact status
-  python build.py info                               # show resolved paths
+  python build.py info                               # show resolved paths + workspace projects
   python build.py idea                               # generate IntelliJ IDEA project files
   python build.py idea --force                       # overwrite existing .iml files
   python build.py idea --java-version 24.0.2-tem     # target a specific JDK in IDEA
@@ -43,10 +43,14 @@ Usage examples
   python build.py repo manifest set-revision develop --project ModularKit
   python build.py repo manifest add MyLib MyLib      # add a project to the manifest
   python build.py repo manifest remove MyLib         # remove a project from the manifest
-  python build.py hooks list                         # show all registered hooks per project
-  python build.py hooks run ModularKit               # dry-run ModularKit pre_build hooks
-  python build.py hooks run ModularKit --mode devel  # dry-run with devel mode
-  python build.py hooks run ModularKit --phase post_build
+  python build.py project list                       # list all workspace projects
+  python build.py project show ModularKit            # print project.json for a project
+  python build.py project init /path/to/MyProject    # create a new project.json
+  python build.py project set ModularKit version 2.0.0
+  python build.py project add-dep ModularKit works.nuka ModularKit
+  python build.py project remove-dep Islands UiKit
+  python build.py project run ModularKit             # dry-run pre_build hooks
+  python build.py project run ModularKit --mode devel
 """
 
 import argparse
@@ -56,6 +60,7 @@ import sys
 import time
 import textwrap
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from xml.dom import minidom
 
 # ── make sure local modules are importable when run as a script ──────────────
@@ -76,16 +81,9 @@ import sdkman
 # Sub-command implementations
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _resolve_hooks(project: dict) -> dict:
-    """
-    Return the hooks dict for a project.
-    ``project["hooks"]`` may be a plain dict or a zero-arg callable that
-    returns a dict (lazy import pattern used in config.py).
-    """
-    hooks_entry = project.get("hooks", {})
-    if callable(hooks_entry):
-        return hooks_entry()  # type: ignore[operator]
-    return hooks_entry or {}
+def _universal_hooks() -> dict:
+    """Return the standard pre/post hook table (universal hook for every project)."""
+    return {"pre_build": [hooksmod.universal_prebuild], "post_build": []}
 
 
 def cmd_build_all(args: argparse.Namespace) -> int:
@@ -93,8 +91,10 @@ def cmd_build_all(args: argparse.Namespace) -> int:
     skip_tests = not args.with_tests
     java_ver   = args.java_version or cfg.JAVA_VERSION
     mode       = getattr(args, "mode", None) or cfg.BUILD_MODE
+    projects   = cfg.get_projects()
     log.banner(
         "Build All",
+        f"Projects: {len(projects)}  |  "
         f"Tests: {'enabled' if args.with_tests else 'skipped'}  |  "
         f"Java: {java_ver or 'ambient'}  |  Mode: {mode}  |  Verbose: {args.verbose}",
     )
@@ -103,14 +103,15 @@ def cmd_build_all(args: argparse.Namespace) -> int:
     if env is None and java_ver:
         return 1
 
-    total = len(cfg.PROJECTS)
+    total = len(projects)
     start = time.time()
-    for i, project in enumerate(cfg.PROJECTS, 1):
+    for i, project in enumerate(projects, 1):
         log.step(i, total, project["name"])
 
         # ── pre-build hooks ──────────────────────────────────────────────
-        ctx = hooksmod.build_hook_context(project, mode=mode, verbose=args.verbose)
-        hook_table = _resolve_hooks(project)
+        ctx = hooksmod.build_hook_context(project, mode=mode, verbose=args.verbose,
+                                          workspace_dir=cfg.WORKSPACE)
+        hook_table = _universal_hooks()
         ok, pom_override, extra_mvn_args = hooksmod.run_hooks("pre_build", hook_table.get("pre_build", []), ctx)
         if not ok:
             log.error(f"Pre-build hook failed for: {project['name']}")
@@ -174,14 +175,15 @@ def cmd_clean(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     """Show whether each project's artifact exists."""
     log.banner("Project Status")
+    projects = cfg.get_projects()
 
     rows = []
-    for p in cfg.PROJECTS:
+    for p in projects:
         art = p.get("artifact")
         if art:
-            exists = art.exists()
+            exists = Path(art).exists()
             mark = "[green]✔[/green]" if exists else "[red]✖[/red]"
-            rows.append((p["name"], str(art.name), mark, str(art.parent)))
+            rows.append((p["name"], str(Path(art).name), mark, str(Path(art).parent)))
         else:
             rows.append((p["name"], "—", "[dim]?[/dim]", "—"))
 
@@ -213,7 +215,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_info(args: argparse.Namespace) -> int:
-    """Print resolved paths and Java configuration for this workspace."""
+    """Print resolved paths and workspace project list."""
     log.banner("Build Configuration")
 
     # Java / sdkman info
@@ -228,20 +230,28 @@ def cmd_info(args: argparse.Namespace) -> int:
         log.warn("   sdkman not found on this machine.")
     print()
 
-    paths = {
-        "Workspace":          cfg.WORKSPACE,
-        "Build dir":          cfg.BUILD_DIR,
-        "Output dir":         cfg.OUTPUT_DIR,
-        "Modules dir":        cfg.MODULES_DIR,
-        "ModularKit dir":     cfg.MODULARKIT_DIR,
-        "CoffeeLoader dir":   cfg.COFFEELOADER_DIR,
-        "Islands dir":        cfg.ISLANDS_DIR,
-        "CoffeeLoader jar":   cfg.COFFEELOADER_OUTPUT_JAR,
-        "Islands module jar": cfg.ISLANDS_MODULE_JAR,
+    # Static paths
+    static_paths = {
+        "Workspace":   cfg.WORKSPACE,
+        "Build dir":   cfg.BUILD_DIR,
+        "Output dir":  cfg.OUTPUT_DIR,
+        "Modules dir": cfg.MODULES_DIR,
     }
-    for label, path in paths.items():
+    for label, path in static_paths.items():
         exists = "✔" if path.exists() else "✖"
         log.info(f"{exists}  {label:<22} {path}")
+    print()
+
+    # Discovered projects
+    projects = cfg.get_projects()
+    log.info(f"Discovered projects ({len(projects)}):")
+    for p in projects:
+        d = Path(p["dir"])
+        art = Path(p["artifact"]) if p.get("artifact") else None
+        art_mark = "✔" if (art and art.exists()) else "✖"
+        log.info(f"  {art_mark}  {p['name']:<16} {d}")
+        if art:
+            log.info(f"       {'artifact':<16} {art.name}")
     return 0
 
 
@@ -250,8 +260,8 @@ def cmd_info(args: argparse.Namespace) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _repos() -> list:
-    """Return the configured list of git repos (cfg.REPOS)."""
-    return getattr(cfg, "REPOS", [{"name": p["name"], "dir": p["dir"]} for p in cfg.PROJECTS])
+    """Return the configured list of git repos (discovered dynamically)."""
+    return cfg.get_repos()
 
 
 def cmd_git_status(args: argparse.Namespace) -> int:
@@ -512,124 +522,86 @@ def cmd_repo_checkout(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
-# ── hooks sub-commands ────────────────────────────────────────────────────────
+# ── project sub-commands ─────────────────────────────────────────────────────
 
-def _load_manifest_or_die(project_name: str):
-    """Load the ProjectManifest for a project by name, or exit with error."""
-    matched = [p for p in cfg.PROJECTS if p["name"].lower() == project_name.lower()]
+def _find_project_by_name(name: str):  # -> tuple[dict | None, hooksmod.ProjectManifest | None]
+    """
+    Look up a project by name (case-insensitive) from the scanned workspace.
+    Returns ``(project_dict, manifest)`` or ``(None, None)`` on failure.
+    The manifest may be None if no ``project.json`` exists.
+    """
+    projects = cfg.get_projects()
+    matched = [p for p in projects if p["name"].lower() == name.lower()]
     if not matched:
-        names = ", ".join(p["name"] for p in cfg.PROJECTS)
-        log.error(f"Project '{project_name}' not found. Available: {names}")
+        names = ", ".join(p["name"] for p in projects)
+        log.error(f"Project '{name}' not found. Available: {names}")
         return None, None
     project = matched[0]
-    from pathlib import Path
     manifest = hooksmod.ProjectManifest.load(Path(project["dir"]))
     if manifest is None:
         log.error(
             f"No project.json found in {project['dir']}.\n"
-            f"Create one with:  hooks manifest init {project_name}"
+            f"Create one with:  project init {Path(project['dir'])}"
         )
         return project, None
     return project, manifest
 
 
-def cmd_hooks_list(args: argparse.Namespace) -> int:
-    """List all registered hooks and project manifest info for every project."""
-    log.banner("Hooks & Project Manifests")
-    from pathlib import Path
+def cmd_project_list(args: argparse.Namespace) -> int:
+    """List all workspace projects discovered from project.json files."""
+    log.banner("Workspace Projects")
+    projects = cfg.get_projects()
+    if not projects:
+        log.warn("No projects found. Add a project.json + pom.xml to a sub-directory.")
+        return 0
 
     try:
         from rich.table import Table
         from rich.console import Console
 
-        # ── hooks table ──────────────────────────────────────────────────
-        hook_table = Table(title="Registered Hooks", show_lines=True)
-        hook_table.add_column("Project",   style="bold cyan",  no_wrap=True)
-        hook_table.add_column("Phase",     style="bold yellow", no_wrap=True)
-        hook_table.add_column("Hook",      style="dim")
-        for project in cfg.PROJECTS:
-            ht = _resolve_hooks(project)
-            for phase in ("pre_build", "post_build"):
-                fns = ht.get(phase, [])
-                names = ", ".join(getattr(f, "__name__", repr(f)) for f in fns) or "[dim](none)[/dim]"
-                hook_table.add_row(project["name"], phase, names)
-        Console().print(hook_table)
+        table = Table(title=f"Projects  ({len(projects)}  in build order)", show_lines=True)
+        table.add_column("#",          justify="right", style="dim")
+        table.add_column("Name",       style="bold cyan",  no_wrap=True)
+        table.add_column("Type",       style="bold")
+        table.add_column("G:A:V",      style="dim")
+        table.add_column("Deps",       style="dim")
+        table.add_column("Built",      justify="center")
+        table.add_column("Dir",        style="dim", overflow="fold")
 
-        # ── manifest table ───────────────────────────────────────────────
-        mf_table = Table(title="Project Manifests (project.json)", show_lines=True)
-        mf_table.add_column("Project",     style="bold cyan",   no_wrap=True)
-        mf_table.add_column("Type",        style="bold")
-        mf_table.add_column("G:A:V",       style="dim")
-        mf_table.add_column("Workspace Deps", style="dim")
-        mf_table.add_column("GPG strip",   justify="center")
-        mf_table.add_column("Nightly",     justify="center")
-        for project in cfg.PROJECTS:
-            m = hooksmod.ProjectManifest.load(Path(project["dir"]))
-            if m is None:
-                mf_table.add_row(project["name"], "[dim]no project.json[/dim]", "—", "—", "—", "—")
-                continue
-            gav  = f"{m.group_id}:{m.artifact_id}:{m.version}"
-            deps = ", ".join(d["artifactId"] for d in m.workspace_deps) or "[dim](none)[/dim]"
-            gpg  = "✔" if m.build.get("strip_gpg_unless_release") else "—"
-            nightly = "✔" if m.build.get("nightly_suffix_on_devel") else "—"
-            type_str = (
-                f"[yellow]{m.project_type}[/yellow]"
-                if m.project_type == "application"
-                else f"[blue]{m.project_type}[/blue]"
-            )
-            mf_table.add_row(project["name"], type_str, gav, deps, gpg, nightly)
-        Console().print(mf_table)
+        for i, p in enumerate(projects, 1):
+            m = hooksmod.ProjectManifest.load(Path(p["dir"]))
+            art = Path(p["artifact"]) if p.get("artifact") else None
+            built = "✔" if (art and art.exists()) else "✖"
+            if m:
+                gav  = f"{m.group_id}:{m.artifact_id}:{m.version}"
+                deps = ", ".join(d["artifactId"] for d in m.workspace_deps) or "—"
+                type_str = (
+                    f"[yellow]{m.project_type}[/yellow]"
+                    if m.project_type == "application"
+                    else f"[blue]{m.project_type}[/blue]"
+                )
+            else:
+                gav = deps = type_str = "[dim]no project.json[/dim]"
+            table.add_row(str(i), p["name"], type_str, gav, deps, built,
+                          str(Path(p["dir"]).relative_to(cfg.WORKSPACE)))
+        Console().print(table)
 
     except ImportError:
-        for project in cfg.PROJECTS:
-            ht = _resolve_hooks(project)
-            for phase in ("pre_build", "post_build"):
-                fns = ht.get(phase, [])
-                names = ", ".join(getattr(f, "__name__", repr(f)) for f in fns) or "(none)"
-                print(f"{project['name']:<16}  {phase:<12}  {names}")
+        print(f"\n{'#':<3}  {'Name':<16}  {'G:A:V':<40}  Built")
+        print("─" * 80)
+        for i, p in enumerate(projects, 1):
+            m = hooksmod.ProjectManifest.load(Path(p["dir"]))
+            art = Path(p["artifact"]) if p.get("artifact") else None
+            built = "✔" if (art and art.exists()) else "✖"
+            gav = f"{m.group_id}:{m.artifact_id}:{m.version}" if m else "—"
+            print(f"{i:<3}  {p['name']:<16}  {gav:<40}  {built}")
+        print()
     return 0
 
 
-def cmd_hooks_run(args: argparse.Namespace) -> int:
-    """Dry-run pre-build hooks for a specific project (no Maven build)."""
-    mode   = args.mode or cfg.BUILD_MODE
-    target = args.project
-
-    matched = [p for p in cfg.PROJECTS if p["name"].lower() == target.lower()]
-    if not matched:
-        names = ", ".join(p["name"] for p in cfg.PROJECTS)
-        log.error(f"Project '{target}' not found. Available: {names}")
-        return 1
-
-    project = matched[0]
-    log.banner(
-        f"Hooks – {project['name']}",
-        f"mode: {mode}  |  phase: {args.phase}",
-    )
-
-    ctx = hooksmod.build_hook_context(project, mode=mode, verbose=args.verbose)
-    ht  = _resolve_hooks(project)
-    fns = ht.get(args.phase, [])
-
-    if not fns:
-        log.warn(f"No {args.phase} hooks registered for '{project['name']}'.")
-        return 0
-
-    ok, pom_override, extra_mvn_args = hooksmod.run_hooks(args.phase, fns, ctx)
-    if ok:
-        if pom_override:
-            log.success(f"pom override → {pom_override}")
-        if extra_mvn_args:
-            log.info(f"extra Maven args → {extra_mvn_args}")
-        log.success("All hooks passed.")
-    else:
-        log.error("One or more hooks failed.")
-    return 0 if ok else 1
-
-
-def cmd_hooks_manifest_show(args: argparse.Namespace) -> int:
-    """Pretty-print the project.json for a project."""
-    project, manifest = _load_manifest_or_die(args.project)
+def cmd_project_show(args: argparse.Namespace) -> int:
+    """Pretty-print project.json for a named project."""
+    project, manifest = _find_project_by_name(args.project)
     if manifest is None:
         return 1
     log.banner(f"Project Manifest – {manifest.name}")
@@ -637,38 +609,60 @@ def cmd_hooks_manifest_show(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_hooks_manifest_init(args: argparse.Namespace) -> int:
-    """Create a starter project.json for a project that doesn't have one."""
-    from pathlib import Path
-    matched = [p for p in cfg.PROJECTS if p["name"].lower() == args.project.lower()]
-    if not matched:
-        log.error(f"Project '{args.project}' not found.")
-        return 1
-    project    = matched[0]
-    proj_dir   = Path(project["dir"])
-    dest       = proj_dir / "project.json"
+def cmd_project_init(args: argparse.Namespace) -> int:
+    """
+    Create a starter project.json in a directory.
+
+    The directory can be:
+      - A name of an existing workspace project (must have a pom.xml).
+      - An absolute or relative path to a directory.
+
+    If the directory already has a project.json, use --force to overwrite.
+    """
+    target_dir = None  # type: Path | None
+
+    # Try to resolve as a project name first
+    projects = cfg.get_projects()
+    by_name = {p["name"].lower(): Path(p["dir"]) for p in projects}
+    if args.dir.lower() in by_name:
+        target_dir = by_name[args.dir.lower()]
+    else:
+        candidate = Path(args.dir).expanduser().resolve()
+        if candidate.is_dir():
+            target_dir = candidate
+        else:
+            # Maybe it's a name of a new project to create inside the workspace
+            target_dir = cfg.WORKSPACE / args.dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+            log.info(f"Created directory: {target_dir}")
+
+    dest = target_dir / "project.json"
     if dest.exists() and not args.force:
         log.warn(f"{dest} already exists. Pass --force to overwrite.")
         return 1
-    import xml.etree.ElementTree as _ET
-    pom = proj_dir / "pom.xml"
+
+    # Derive identity from pom.xml if available
+    pom = target_dir / "pom.xml"
     group_id = artifact_id = version = ""
     if pom.exists():
         try:
+            import xml.etree.ElementTree as _ET
             root = _ET.parse(str(pom)).getroot()
             ns   = "http://maven.apache.org/POM/4.0.0"
-            group_id   = (root.findtext(f"{{{ns}}}groupId")   or "").strip()
-            artifact_id= (root.findtext(f"{{{ns}}}artifactId")or "").strip()
-            version    = (root.findtext(f"{{{ns}}}version")   or "").strip()
+            group_id    = (root.findtext(f"{{{ns}}}groupId")    or "").strip()
+            artifact_id = (root.findtext(f"{{{ns}}}artifactId") or "").strip()
+            version     = (root.findtext(f"{{{ns}}}version")    or "").strip()
         except Exception:
             pass
+
+    name = args.name or artifact_id or target_dir.name
     data = {
-        "name":        project["name"],
-        "groupId":     group_id or "works.nuka",
-        "artifactId":  artifact_id or project["name"],
-        "version":     version or "1.0.0",
+        "name":        name,
+        "groupId":     args.group_id or group_id or "works.nuka",
+        "artifactId":  args.artifact_id or artifact_id or name,
+        "version":     args.version or version or "1.0.0",
         "type":        args.type,
-        "description": "",
+        "description": args.description or "",
         "build": {
             "strip_gpg_unless_release": args.type == "library",
             "nightly_suffix_on_devel":  args.type == "library",
@@ -678,12 +672,60 @@ def cmd_hooks_manifest_init(args: argparse.Namespace) -> int:
     dest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     log.success(f"Created {dest}")
     print(dest.read_text(encoding="utf-8"))
+
+    # Invalidate the project cache so subsequent commands see the new project
+    cfg._projects_cache = None
     return 0
 
 
-def cmd_hooks_manifest_set(args: argparse.Namespace) -> int:
-    """Set a field on the project.json (version, type, groupId, artifactId, description)."""
-    project, manifest = _load_manifest_or_die(args.project)
+def _sync_poms_after_manifest_change(changed_manifest: "hooksmod.ProjectManifest") -> None:
+    """
+    After a project.json is saved, patch pom.xml files to keep versions in sync:
+
+    1. The changed project's own pom.xml  (its identity block: groupId/artifactId/version).
+    2. Every other workspace project whose workspace_dependencies include the
+       changed project  (so their <dependency> version is updated too).
+    """
+    cfg._projects_cache = None   # force re-scan with fresh manifests
+
+    # Build a full {artifactId: manifest} map from the current workspace
+    workspace = cfg.WORKSPACE
+    all_manifests: dict[str, hooksmod.ProjectManifest] = {}
+    for entry in sorted(workspace.iterdir()):
+        if not entry.is_dir():
+            continue
+        try:
+            m = hooksmod.ProjectManifest.load(entry)
+        except ValueError:
+            m = None
+        if m is not None:
+            all_manifests[m.artifact_id] = m
+
+    patched = []
+
+    # 1. Patch the changed project's own pom
+    if hooksmod.sync_pom_versions(changed_manifest.path.parent, all_manifests):
+        patched.append(changed_manifest.name)
+
+    # Sync module.json if the project has a module block
+    hooksmod.sync_module_json(changed_manifest)
+
+    # 2. Patch every dependent project
+    for aid, m in all_manifests.items():
+        if m.artifact_id == changed_manifest.artifact_id:
+            continue
+        dep_ids = {d.get("artifactId") for d in m.workspace_deps}
+        if changed_manifest.artifact_id in dep_ids:
+            if hooksmod.sync_pom_versions(m.path.parent, all_manifests):
+                patched.append(m.name)
+
+    if patched:
+        log.success(f"pom.xml synced: {', '.join(patched)}")
+
+
+def cmd_project_set(args: argparse.Namespace) -> int:
+    """Set a field on a project's project.json."""
+    project, manifest = _find_project_by_name(args.project)
     if manifest is None:
         return 1
 
@@ -708,18 +750,22 @@ def cmd_hooks_manifest_set(args: argparse.Namespace) -> int:
     elif field_name == "nightly":
         manifest.build["nightly_suffix_on_devel"] = value.lower() in ("true", "1", "yes")
     else:
-        log.error(f"Unknown field '{field_name}'. Choose from: version, type, groupId, artifactId, description, strip_gpg, nightly")
+        log.error(
+            f"Unknown field '{field_name}'. Choose from: "
+            "version, type, groupId, artifactId, description, strip_gpg, nightly"
+        )
         return 1
 
     manifest.save()
+    _sync_poms_after_manifest_change(manifest)
     log.success(f"Updated {manifest.path.name}:  {field_name} = {value}")
     print(manifest.path.read_text(encoding="utf-8"))
     return 0
 
 
-def cmd_hooks_manifest_add_dep(args: argparse.Namespace) -> int:
+def cmd_project_add_dep(args: argparse.Namespace) -> int:
     """Add a workspace dependency to a project's project.json."""
-    project, manifest = _load_manifest_or_die(args.project)
+    project, manifest = _find_project_by_name(args.project)
     if manifest is None:
         return 1
 
@@ -731,28 +777,73 @@ def cmd_hooks_manifest_add_dep(args: argparse.Namespace) -> int:
 
     manifest.workspace_deps.append(new_dep)
     manifest.save()
+    _sync_poms_after_manifest_change(manifest)
     log.success(f"Added workspace dep {args.group_id}:{args.artifact_id} to {manifest.name}")
+    print(manifest.path.read_text(encoding="utf-8"))
     return 0
 
 
-def cmd_hooks_manifest_remove_dep(args: argparse.Namespace) -> int:
+def cmd_project_remove_dep(args: argparse.Namespace) -> int:
     """Remove a workspace dependency from a project's project.json."""
-    project, manifest = _load_manifest_or_die(args.project)
+    project, manifest = _find_project_by_name(args.project)
     if manifest is None:
         return 1
 
     before = len(manifest.workspace_deps)
     manifest.workspace_deps = [
         d for d in manifest.workspace_deps
-        if not (d["artifactId"] == args.artifact_id
-                and (args.group_id is None or d["groupId"] == args.group_id))
+        if not (
+            d["artifactId"] == args.artifact_id
+            and (args.group_id is None or d["groupId"] == args.group_id)
+        )
     ]
     if len(manifest.workspace_deps) == before:
         log.warn(f"Dependency '{args.artifact_id}' not found in {manifest.name}.")
         return 1
     manifest.save()
+    _sync_poms_after_manifest_change(manifest)
     log.success(f"Removed workspace dep '{args.artifact_id}' from {manifest.name}")
+    print(manifest.path.read_text(encoding="utf-8"))
     return 0
+
+
+def cmd_project_run(args: argparse.Namespace) -> int:
+    """Dry-run pre-build hooks for a specific project (no Maven build)."""
+    mode   = args.mode or cfg.BUILD_MODE
+    target = args.project
+
+    projects = cfg.get_projects()
+    matched = [p for p in projects if p["name"].lower() == target.lower()]
+    if not matched:
+        names = ", ".join(p["name"] for p in projects)
+        log.error(f"Project '{target}' not found. Available: {names}")
+        return 1
+
+    project = matched[0]
+    log.banner(
+        f"Project hooks – {project['name']}",
+        f"mode: {mode}  |  phase: {args.phase}",
+    )
+
+    ctx = hooksmod.build_hook_context(project, mode=mode, verbose=args.verbose,
+                                      workspace_dir=cfg.WORKSPACE)
+    hook_table = _universal_hooks()
+    fns = hook_table.get(args.phase, [])
+
+    if not fns:
+        log.warn(f"No {args.phase} hooks for '{project['name']}'.")
+        return 0
+
+    ok, pom_override, extra_mvn_args = hooksmod.run_hooks(args.phase, fns, ctx)
+    if ok:
+        if pom_override:
+            log.success(f"pom override → {pom_override}")
+        if extra_mvn_args:
+            log.info(f"extra Maven args → {extra_mvn_args}")
+        log.success("All hooks passed.")
+    else:
+        log.error("One or more hooks failed.")
+    return 0 if ok else 1
 
 
 # ── sdk sub-commands ──────────────────────────────────────────────────────────
@@ -821,25 +912,23 @@ def _pretty_xml(element: ET.Element) -> str:
 
 
 def cmd_idea(args: argparse.Namespace) -> int:
-    """Generate / refresh IntelliJ IDEA .idea project files for the monorepo."""
+    """Generate / refresh IntelliJ IDEA .idea monorepo project files."""
     log.banner("IDEA Project Setup", "Generating IntelliJ IDEA monorepo configuration")
 
     idea_dir = cfg.WORKSPACE / ".idea"
     idea_dir.mkdir(exist_ok=True)
 
     java_ver = args.java_version or cfg.JAVA_VERSION or "24"
-    # Extract major version number only (e.g. "24.0.2-tem" → "24")
     java_major = java_ver.split(".")[0].split("-")[0]
     lang_level = f"JDK_{java_major}"
 
-    # ── modules.xml ──────────────────────────────────────────────────────────
-    # Each Maven project gets registered as a Maven module in IDEA
+    # Discover Maven modules dynamically
     maven_modules = [
-        ("ModularKit",   cfg.MODULARKIT_DIR),
-        ("CoffeeLoader", cfg.COFFEELOADER_DIR),
-        ("Islands",      cfg.ISLANDS_DIR),
+        (p["name"], Path(p["dir"]))
+        for p in cfg.get_projects()
     ]
 
+    # ── modules.xml ──────────────────────────────────────────────────────────
     project_el = ET.Element("project", version="4")
     mgr = ET.SubElement(project_el, "component", name="ProjectModuleManager")
     modules_el = ET.SubElement(mgr, "modules")
@@ -851,7 +940,7 @@ def cmd_idea(args: argparse.Namespace) -> int:
                   filepath=build_iml)
 
     # Root IDEA module
-    root_iml = "$PROJECT_DIR$/.idea/Islands.iml"
+    root_iml = f"$PROJECT_DIR$/.idea/{cfg.WORKSPACE.name}.iml"
     ET.SubElement(modules_el, "module",
                   fileurl=f"file://{root_iml}",
                   filepath=root_iml)
@@ -871,11 +960,6 @@ def cmd_idea(args: argparse.Namespace) -> int:
 
     # ── misc.xml ─────────────────────────────────────────────────────────────
     misc_el = ET.Element("project", version="4")
-    ET.SubElement(misc_el, "component",
-                  name="Black",
-                  **{"option": ""})  # placeholder
-    # Rebuild without placeholder
-    misc_el = ET.Element("project", version="4")
     black = ET.SubElement(misc_el, "component", name="Black")
     opt = ET.SubElement(black, "option", name="sdkName")
     opt.set("value", "Python 3.13")
@@ -886,7 +970,6 @@ def cmd_idea(args: argparse.Namespace) -> int:
                               **{"project-jdk-name": f"Java {java_major}",
                                  "project-jdk-type": "JavaSDK"})
     ET.SubElement(root_mgr, "output", url="file://$PROJECT_DIR$/out")
-
     misc_xml_path = idea_dir / "misc.xml"
     misc_xml_path.write_text(_pretty_xml(misc_el), encoding="utf-8")
     log.success(f"Written: {misc_xml_path.relative_to(cfg.WORKSPACE)}")
@@ -897,23 +980,16 @@ def cmd_idea(args: argparse.Namespace) -> int:
         if iml_path.exists() and not args.force:
             log.info(f"Skipping (already exists): {iml_path.relative_to(cfg.WORKSPACE)}")
             continue
-        iml_el = ET.Element("module",
-                             type="JAVA_MODULE",
-                             version="4")
+        iml_el = ET.Element("module", type="JAVA_MODULE", version="4")
         root_mgr_el = ET.SubElement(iml_el, "component",
                                      name="NewModuleRootManager",
                                      **{"inherit-compiler-output": "true"})
         ET.SubElement(root_mgr_el, "exclude-output")
-        content = ET.SubElement(root_mgr_el, "content",
-                                 url="file://$MODULE_DIR$")
-        pom = project_dir / "pom.xml"
-        if pom.exists():
-            ET.SubElement(content, "excludeFolder",
-                          url="file://$MODULE_DIR$/target")
-        ET.SubElement(root_mgr_el, "orderEntry",
-                      type="inheritedJdk")
-        ET.SubElement(root_mgr_el, "orderEntry",
-                      type="sourceFolder", forTests="false")
+        content = ET.SubElement(root_mgr_el, "content", url="file://$MODULE_DIR$")
+        if (project_dir / "pom.xml").exists():
+            ET.SubElement(content, "excludeFolder", url="file://$MODULE_DIR$/target")
+        ET.SubElement(root_mgr_el, "orderEntry", type="inheritedJdk")
+        ET.SubElement(root_mgr_el, "orderEntry", type="sourceFolder", forTests="false")
         iml_path.write_text(_pretty_xml(iml_el), encoding="utf-8")
         log.success(f"Written: {iml_path.relative_to(cfg.WORKSPACE)}")
 
@@ -922,9 +998,7 @@ def cmd_idea(args: argparse.Namespace) -> int:
     if not vcs_path.exists() or args.force:
         vcs_el = ET.Element("project", version="4")
         vcs_comp = ET.SubElement(vcs_el, "component", name="VcsDirectoryMappings")
-        ET.SubElement(vcs_comp, "mapping",
-                      directory="$PROJECT_DIR$",
-                      vcs="Git")
+        ET.SubElement(vcs_comp, "mapping", directory="$PROJECT_DIR$", vcs="Git")
         vcs_path.write_text(_pretty_xml(vcs_el), encoding="utf-8")
         log.success(f"Written: {vcs_path.relative_to(cfg.WORKSPACE)}")
 
@@ -932,10 +1006,10 @@ def cmd_idea(args: argparse.Namespace) -> int:
     enc_path = idea_dir / "encodings.xml"
     if not enc_path.exists() or args.force:
         enc_el = ET.Element("project", version="4")
-        enc_comp = ET.SubElement(enc_el, "component",
-                                  name="Encoding",
-                                  addBOMForNewFiles=";UTF-8:with NO BOM",
-                                  defaultCharsetForPropertiesFiles="UTF-8")
+        ET.SubElement(enc_el, "component",
+                      name="Encoding",
+                      addBOMForNewFiles=";UTF-8:with NO BOM",
+                      defaultCharsetForPropertiesFiles="UTF-8")
         enc_path.write_text(_pretty_xml(enc_el), encoding="utf-8")
         log.success(f"Written: {enc_path.relative_to(cfg.WORKSPACE)}")
 
@@ -943,8 +1017,7 @@ def cmd_idea(args: argparse.Namespace) -> int:
     compiler_path = idea_dir / "compiler.xml"
     comp_el = ET.Element("project", version="4")
     compiler_comp = ET.SubElement(comp_el, "component", name="CompilerConfiguration")
-    ET.SubElement(compiler_comp, "bytecodeTargetLevel",
-                  **{"target": java_major})
+    ET.SubElement(compiler_comp, "bytecodeTargetLevel", **{"target": java_major})
     compiler_path.write_text(_pretty_xml(comp_el), encoding="utf-8")
     log.success(f"Written: {compiler_path.relative_to(cfg.WORKSPACE)}")
 
@@ -1026,7 +1099,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  2. mvn clean install  CoffeeLoader\n"
             "  3. mvn clean install  Islands\n"
             "  4. Assemble output/ directory\n"
-            "  5. Write CoffeeLoader config.json  (sources → output/modules/)\n"
+            "  5. Write CoffeeLoader config.json  (sources -> output/modules/)\n"
             "  6. java -jar CoffeeLoader          (blocks until Ctrl+C)\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1042,7 +1115,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--verbose", "-v", action="store_true",
         help="Show full Maven output")
     p_run.add_argument("--java-opts", metavar="OPTS", default=None,
-        help='Extra JVM options before -jar, e.g. "--java-opts \"-Xmx512m\""')
+        help="Extra JVM options before -jar, e.g. --java-opts '-Xmx512m'")
     _add_java_version_arg(p_run)
     _add_mode_arg(p_run)
     p_run.set_defaults(func=cmd_run_islands)
@@ -1074,9 +1147,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generate / refresh IntelliJ IDEA .idea monorepo project files",
         description=(
             "Creates / updates .idea/modules.xml, .idea/misc.xml, .idea/compiler.xml,\n"
-            ".idea/vcs.xml, .idea/encodings.xml and a <Name>.iml for each Maven module,\n"
+            ".idea/vcs.xml, .idea/encodings.xml and a MODULE.iml for each Maven module,\n"
             "so the workspace root can be opened as a single IDEA project containing\n"
-            "ModularKit, CoffeeLoader and Islands as module entries."
+            "all discovered Maven projects as module entries."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1091,352 +1164,179 @@ def build_parser() -> argparse.ArgumentParser:
     p_git = sub.add_parser(
         "git",
         help="Git repository management across all repos",
-        description=(
-            "Manage all git repositories in the Islands mono-repo.\n\n"
-            "Sub-commands:\n"
-            "  status    – show branch + working-tree status for every repo\n"
-            "  branches  – list all local branches for every repo\n"
-            "  checkout  – switch every repo to a given branch\n"
-            "  fetch     – git fetch --all --prune on every repo\n"
-            "  pull      – git pull on every repo\n"
-        ),
+        description="Manage all git repos.\n\nSub-commands: status | branches | checkout | fetch | pull",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     git_sub = p_git.add_subparsers(dest="git_command", metavar="<git-command>")
     git_sub.required = True
 
     # git status
-    p_git_status = git_sub.add_parser(
-        "status",
-        help="Show branch and working-tree status for all repos",
-    )
+    p_git_status = git_sub.add_parser("status", help="Show branch and working-tree status for all repos")
     p_git_status.set_defaults(func=cmd_git_status)
 
     # git branches
-    p_git_branches = git_sub.add_parser(
-        "branches",
-        help="List all local branches for all repos",
-    )
+    p_git_branches = git_sub.add_parser("branches", help="List all local branches for all repos")
     p_git_branches.set_defaults(func=cmd_git_branches)
 
     # git checkout
-    p_git_checkout = git_sub.add_parser(
-        "checkout",
-        help="Switch all repos to a given branch",
-        description=(
-            "Checks out <branch> in every repo that has it locally.\n"
-            "Repos that don't have the branch are skipped unless --create is passed."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    p_git_checkout.add_argument("branch", metavar="BRANCH",
-        help="Branch name to check out")
-    p_git_checkout.add_argument("--create", "-b", action="store_true",
-        help="Create the branch if it doesn't exist yet")
-    p_git_checkout.add_argument("--force", "-f", action="store_true",
-        help="Continue even if checkout fails in some repos")
+    p_git_checkout = git_sub.add_parser("checkout", help="Switch all repos to a given branch")
+    p_git_checkout.add_argument("branch", metavar="BRANCH")
+    p_git_checkout.add_argument("--create", "-b", action="store_true")
+    p_git_checkout.add_argument("--force",  "-f", action="store_true")
     p_git_checkout.set_defaults(func=cmd_git_checkout)
 
     # git fetch
-    p_git_fetch = git_sub.add_parser(
-        "fetch",
-        help="Run 'git fetch --all --prune' on every repo",
-    )
-    p_git_fetch.add_argument("--verbose", "-v", action="store_true",
-        help="Show git output")
+    p_git_fetch = git_sub.add_parser("fetch", help="Run 'git fetch --all --prune' on every repo")
+    p_git_fetch.add_argument("--verbose", "-v", action="store_true")
     p_git_fetch.set_defaults(func=cmd_git_fetch)
 
     # git pull
-    p_git_pull = git_sub.add_parser(
-        "pull",
-        help="Run 'git pull' on every repo",
-    )
-    p_git_pull.add_argument("--verbose", "-v", action="store_true",
-        help="Show git output")
+    p_git_pull = git_sub.add_parser("pull", help="Run 'git pull' on every repo")
+    p_git_pull.add_argument("--verbose", "-v", action="store_true")
     p_git_pull.set_defaults(func=cmd_git_pull)
 
     # ── repo (Google repo tool) ────────────────────────────────────────────────
-    p_repo = sub.add_parser(
-        "repo",
-        help="Google repo tool management (manifest, sync, forall, checkout…)",
-        description=(
-            "Manage the Islands mono-repo via the Google repo tool.\n\n"
-            "Sub-commands:\n"
-            "  manifest  – show / edit the manifest XML\n"
-            "  status    – repo status across all projects\n"
-            "  info      – repo info (manifest branch, remotes, revisions)\n"
-            "  sync      – repo sync (fetch + update all projects)\n"
-            "  forall    – run a shell command in every project\n"
-            "  checkout  – switch every project to a given branch\n"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+    p_repo = sub.add_parser("repo", help="Google repo tool management")
     repo_sub = p_repo.add_subparsers(dest="repo_command", metavar="<repo-command>")
     repo_sub.required = True
 
-    # repo manifest (has its own sub-sub-commands)
-    p_rm = repo_sub.add_parser(
-        "manifest",
-        help="Show or modify the default.xml manifest",
-        description=(
-            "Show the manifest projects table, or modify the manifest.\n\n"
-            "  manifest show                             print the table\n"
-            "  manifest set-revision <REV>               change <default revision>\n"
-            "  manifest set-revision <REV> --project P   set revision for one project\n"
-            "  manifest clear-revision --project P       remove per-project override\n"
-            "  manifest add <NAME> <PATH>                add a project\n"
-            "  manifest remove <NAME|PATH>               remove a project\n"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+    p_rm = repo_sub.add_parser("manifest", help="Show or modify the default.xml manifest")
     rm_sub = p_rm.add_subparsers(dest="manifest_command", metavar="<manifest-command>")
-
-    # manifest show (default)
-    p_rm_show = rm_sub.add_parser("show", help="Print the manifest projects table")
+    p_rm_show = rm_sub.add_parser("show")
     p_rm_show.set_defaults(func=cmd_repo_manifest)
-
-    # manifest set-revision
-    p_rm_setrev = rm_sub.add_parser(
-        "set-revision",
-        help="Change the default (or per-project) revision in the manifest",
-    )
-    p_rm_setrev.add_argument("revision", metavar="REVISION",
-        help="Branch name, tag, or SHA to set as revision")
-    p_rm_setrev.add_argument("--project", "-p", metavar="NAME_OR_PATH", default=None,
-        help="Limit change to this project only (default: change <default> element)")
+    p_rm_setrev = rm_sub.add_parser("set-revision")
+    p_rm_setrev.add_argument("revision", metavar="REVISION")
+    p_rm_setrev.add_argument("--project", "-p", metavar="NAME_OR_PATH", default=None)
     p_rm_setrev.set_defaults(func=cmd_repo_manifest)
-
-    # manifest clear-revision
-    p_rm_clrrev = rm_sub.add_parser(
-        "clear-revision",
-        help="Remove a per-project revision override (revert to <default>)",
-    )
-    p_rm_clrrev.add_argument("--project", "-p", metavar="NAME_OR_PATH", required=True,
-        help="Project name or path whose revision override to remove")
+    p_rm_clrrev = rm_sub.add_parser("clear-revision")
+    p_rm_clrrev.add_argument("--project", "-p", metavar="NAME_OR_PATH", required=True)
     p_rm_clrrev.set_defaults(func=cmd_repo_manifest)
-
-    # manifest add
-    p_rm_add = rm_sub.add_parser(
-        "add",
-        help="Add a project to the manifest",
-    )
-    p_rm_add.add_argument("name", metavar="NAME",  help="Repo name (e.g. MyLib)")
-    p_rm_add.add_argument("path", metavar="PATH",  help="Checkout path (e.g. MyLib)")
+    p_rm_add = rm_sub.add_parser("add")
+    p_rm_add.add_argument("name", metavar="NAME")
+    p_rm_add.add_argument("path", metavar="PATH")
     p_rm_add.add_argument("--revision", metavar="REV",    default=None)
     p_rm_add.add_argument("--remote",   metavar="REMOTE", default=None)
     p_rm_add.add_argument("--groups",   metavar="GROUPS", default=None)
     p_rm_add.set_defaults(func=cmd_repo_manifest)
-
-    # manifest remove
-    p_rm_del = rm_sub.add_parser(
-        "remove",
-        help="Remove a project from the manifest",
-    )
-    p_rm_del.add_argument("project", metavar="NAME_OR_PATH",
-        help="Project name or path to remove")
+    p_rm_del = rm_sub.add_parser("remove")
+    p_rm_del.add_argument("project", metavar="NAME_OR_PATH")
     p_rm_del.set_defaults(func=cmd_repo_manifest)
-
-    # Fall-through: bare `repo manifest` shows the table
     p_rm.set_defaults(func=cmd_repo_manifest)
 
-    # repo status
-    p_repo_status = repo_sub.add_parser(
-        "status",
-        help="Show repo status for all projects",
-    )
+    p_repo_status = repo_sub.add_parser("status")
     p_repo_status.set_defaults(func=cmd_repo_status)
-
-    # repo info
-    p_repo_info = repo_sub.add_parser(
-        "info",
-        help="Show repo info (manifest branch, remotes, project revisions)",
-    )
+    p_repo_info = repo_sub.add_parser("info")
     p_repo_info.set_defaults(func=cmd_repo_info)
-
-    # repo sync
-    p_repo_sync = repo_sub.add_parser(
-        "sync",
-        help="Run repo sync (fetch + update all or selected projects)",
-    )
-    p_repo_sync.add_argument("projects", metavar="PROJECT", nargs="*",
-        help="Limit sync to these project paths/names (default: all)")
-    p_repo_sync.add_argument("-j", "--jobs", type=int, default=4, metavar="N",
-        help="Parallel fetch jobs (default: 4)")
-    p_repo_sync.add_argument("--verbose", "-v", action="store_true",
-        help="Show repo output")
+    p_repo_sync = repo_sub.add_parser("sync")
+    p_repo_sync.add_argument("projects", metavar="PROJECT", nargs="*")
+    p_repo_sync.add_argument("-j", "--jobs", type=int, default=4, metavar="N")
+    p_repo_sync.add_argument("--verbose", "-v", action="store_true")
     p_repo_sync.set_defaults(func=cmd_repo_sync)
-
-    # repo forall
-    p_repo_forall = repo_sub.add_parser(
-        "forall",
-        help="Run a shell command in every project (repo forall -c …)",
-    )
-    p_repo_forall.add_argument("cmd", metavar="COMMAND",
-        help='Shell command to run in each project, e.g. "git log --oneline -3"')
-    p_repo_forall.add_argument("--verbose", "-v", action="store_true",
-        help="Show repo output")
+    p_repo_forall = repo_sub.add_parser("forall")
+    p_repo_forall.add_argument("cmd", metavar="COMMAND")
+    p_repo_forall.add_argument("--verbose", "-v", action="store_true")
     p_repo_forall.set_defaults(func=cmd_repo_forall)
-
-    # repo checkout
-    p_repo_co = repo_sub.add_parser(
-        "checkout",
-        help="Switch every project to a given branch",
-        description=(
-            "Checks out <branch> in every manifest project.\n"
-            "Projects that don't have the branch locally are skipped unless --create."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    p_repo_co.add_argument("branch", metavar="BRANCH",
-        help="Branch name to check out")
-    p_repo_co.add_argument("--create", "-b", action="store_true",
-        help="Create the branch if it doesn't already exist")
-    p_repo_co.add_argument("--force", "-f", action="store_true",
-        help="Continue even if checkout fails in some projects")
+    p_repo_co = repo_sub.add_parser("checkout")
+    p_repo_co.add_argument("branch", metavar="BRANCH")
+    p_repo_co.add_argument("--create", "-b", action="store_true")
+    p_repo_co.add_argument("--force",  "-f", action="store_true")
     p_repo_co.set_defaults(func=cmd_repo_checkout)
 
-    # ── hooks ─────────────────────────────────────────────────────────────────
-    p_hooks = sub.add_parser(
-        "hooks",
-        help="Hook system: list, dry-run, and manage project.json manifests",
+    # ── project ───────────────────────────────────────────────────────────────
+    p_proj = sub.add_parser(
+        "project",
+        help="Manage workspace projects and their project.json manifests",
         description=(
-            "Inspect/test the hook system and manage project.json manifests.\n\n"
+            "Manage workspace projects discovered via project.json files.\n\n"
             "Sub-commands:\n"
-            "  list                      – show hooks + manifest summary for all projects\n"
-            "  run   <PROJECT>           – dry-run hooks (no Maven build)\n"
-            "  manifest show  <PROJECT>  – print project.json\n"
-            "  manifest init  <PROJECT>  – create a starter project.json\n"
-            "  manifest set   <PROJECT> <FIELD> <VALUE>  – edit a manifest field\n"
-            "  manifest add-dep   <PROJECT> <groupId> <artifactId>\n"
-            "  manifest remove-dep <PROJECT> <artifactId>\n"
+            "  list                       list all discovered projects\n"
+            "  show   <PROJECT>           print project.json\n"
+            "  init   <DIR> [options]     create a new project.json\n"
+            "  set    <PROJECT> <F> <V>   edit a manifest field\n"
+            "  add-dep    <P> <G> <A>     add a workspace dependency\n"
+            "  remove-dep <P> <A>         remove a workspace dependency\n"
+            "  run    <PROJECT>           dry-run pre_build hooks\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    hooks_sub = p_hooks.add_subparsers(dest="hooks_command", metavar="<hooks-command>")
-    hooks_sub.required = True
+    proj_sub = p_proj.add_subparsers(dest="project_command", metavar="<project-command>")
+    proj_sub.required = True
 
-    # hooks list
-    p_hooks_list = hooks_sub.add_parser(
-        "list",
-        help="Show registered hooks and project.json summary for all projects",
-    )
-    p_hooks_list.set_defaults(func=cmd_hooks_list)
+    p_proj_list = proj_sub.add_parser("list", help="List all workspace projects")
+    p_proj_list.set_defaults(func=cmd_project_list)
 
-    # hooks run
-    p_hooks_run = hooks_sub.add_parser(
-        "run",
-        help="Dry-run hooks for a specific project (no Maven build)",
-        description=(
-            "Execute the hooks for one project and report the result.\n"
-            "Useful for testing hook logic without triggering a full build."
-        ),
+    p_proj_show = proj_sub.add_parser("show", help="Print project.json for a project")
+    p_proj_show.add_argument("project", metavar="PROJECT")
+    p_proj_show.set_defaults(func=cmd_project_show)
+
+    p_proj_init = proj_sub.add_parser(
+        "init",
+        help="Create a starter project.json (reads pom.xml if present)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_hooks_run.add_argument("project", metavar="PROJECT",
-        help="Project name to run hooks for (e.g. ModularKit)")
-    p_hooks_run.add_argument(
-        "--phase", metavar="PHASE", default="pre_build",
-        choices=["pre_build", "post_build"],
-        help="Hook phase to run (pre_build or post_build, default: pre_build)",
-    )
-    p_hooks_run.add_argument("--verbose", "-v", action="store_true",
-        help="Show hook script output")
-    _add_mode_arg(p_hooks_run)
-    p_hooks_run.set_defaults(func=cmd_hooks_run)
-
-    # hooks manifest (sub-sub-commands)
-    p_hm = hooks_sub.add_parser(
-        "manifest",
-        help="Show or edit a project's project.json manifest",
-        description=(
-            "Manage project.json manifests (the single source of truth for\n"
-            "project identity, type, and workspace dependency versions).\n\n"
-            "  show  <PROJECT>                    print project.json\n"
-            "  init  <PROJECT> [--type TYPE]      create starter project.json\n"
-            "  set   <PROJECT> <FIELD> <VALUE>    edit a field\n"
-            "      fields: version | type | groupId | artifactId |\n"
-            "              description | strip_gpg | nightly\n"
-            "  add-dep    <PROJECT> <GROUP_ID> <ARTIFACT_ID>\n"
-            "  remove-dep <PROJECT> <ARTIFACT_ID> [--group-id GROUP_ID]\n"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    hm_sub = p_hm.add_subparsers(dest="manifest_sub", metavar="<manifest-command>")
-    hm_sub.required = True
-
-    # hooks manifest show
-    p_hm_show = hm_sub.add_parser("show", help="Print project.json for a project")
-    p_hm_show.add_argument("project", metavar="PROJECT")
-    p_hm_show.set_defaults(func=cmd_hooks_manifest_show)
-
-    # hooks manifest init
-    p_hm_init = hm_sub.add_parser("init", help="Create a starter project.json")
-    p_hm_init.add_argument("project", metavar="PROJECT")
-    p_hm_init.add_argument(
-        "--type", default="library", choices=["library", "application"],
-        help="Project type (default: library)",
-    )
-    p_hm_init.add_argument("--force", "-f", action="store_true",
+    p_proj_init.add_argument("dir", metavar="DIR",
+        help="Project name, absolute path, or new folder name to initialise")
+    p_proj_init.add_argument("--type", default="library", choices=["library", "application"])
+    p_proj_init.add_argument("--name",        default=None,
+        help="Override project name (default: derived from pom.xml or dir name)")
+    p_proj_init.add_argument("--group-id",    dest="group_id",    default=None,
+        help="Override groupId (default: from pom.xml or 'works.nuka')")
+    p_proj_init.add_argument("--artifact-id", dest="artifact_id", default=None,
+        help="Override artifactId (default: from pom.xml or dir name)")
+    p_proj_init.add_argument("--version",     default=None,
+        help="Override version (default: from pom.xml or '1.0.0')")
+    p_proj_init.add_argument("--description", default=None, help="Project description")
+    p_proj_init.add_argument("--force", "-f", action="store_true",
         help="Overwrite existing project.json")
-    p_hm_init.set_defaults(func=cmd_hooks_manifest_init)
+    p_proj_init.set_defaults(func=cmd_project_init)
 
-    # hooks manifest set
-    p_hm_set = hm_sub.add_parser(
-        "set",
-        help="Set a field in project.json  (version|type|groupId|artifactId|description|strip_gpg|nightly)",
-    )
-    p_hm_set.add_argument("project", metavar="PROJECT")
-    p_hm_set.add_argument("field",   metavar="FIELD",
+    p_proj_set = proj_sub.add_parser("set",
+        help="Set a field in project.json")
+    p_proj_set.add_argument("project", metavar="PROJECT")
+    p_proj_set.add_argument("field",   metavar="FIELD",
         choices=["version","type","groupId","artifactId","description","strip_gpg","nightly"])
-    p_hm_set.add_argument("value",   metavar="VALUE")
-    p_hm_set.set_defaults(func=cmd_hooks_manifest_set)
+    p_proj_set.add_argument("value",   metavar="VALUE")
+    p_proj_set.set_defaults(func=cmd_project_set)
 
-    # hooks manifest add-dep
-    p_hm_adddep = hm_sub.add_parser("add-dep", help="Add a workspace dependency to project.json")
-    p_hm_adddep.add_argument("project",     metavar="PROJECT")
-    p_hm_adddep.add_argument("group_id",    metavar="GROUP_ID")
-    p_hm_adddep.add_argument("artifact_id", metavar="ARTIFACT_ID")
-    p_hm_adddep.set_defaults(func=cmd_hooks_manifest_add_dep)
+    p_proj_adddep = proj_sub.add_parser("add-dep",
+        help="Add a workspace dependency to project.json")
+    p_proj_adddep.add_argument("project",     metavar="PROJECT")
+    p_proj_adddep.add_argument("group_id",    metavar="GROUP_ID")
+    p_proj_adddep.add_argument("artifact_id", metavar="ARTIFACT_ID")
+    p_proj_adddep.set_defaults(func=cmd_project_add_dep)
 
-    # hooks manifest remove-dep
-    p_hm_rmdep = hm_sub.add_parser("remove-dep", help="Remove a workspace dependency from project.json")
-    p_hm_rmdep.add_argument("project",     metavar="PROJECT")
-    p_hm_rmdep.add_argument("artifact_id", metavar="ARTIFACT_ID")
-    p_hm_rmdep.add_argument("--group-id",  metavar="GROUP_ID", default=None,
-        dest="group_id", help="Optionally restrict by groupId")
-    p_hm_rmdep.set_defaults(func=cmd_hooks_manifest_remove_dep)
+    p_proj_rmdep = proj_sub.add_parser("remove-dep",
+        help="Remove a workspace dependency from project.json")
+    p_proj_rmdep.add_argument("project",     metavar="PROJECT")
+    p_proj_rmdep.add_argument("artifact_id", metavar="ARTIFACT_ID")
+    p_proj_rmdep.add_argument("--group-id",  metavar="GROUP_ID", default=None, dest="group_id")
+    p_proj_rmdep.set_defaults(func=cmd_project_remove_dep)
+
+    p_proj_run = proj_sub.add_parser("run",
+        help="Dry-run pre_build hooks for a project (no Maven build)")
+    p_proj_run.add_argument("project", metavar="PROJECT")
+    p_proj_run.add_argument("--phase", metavar="PHASE", default="pre_build",
+        choices=["pre_build", "post_build"])
+    p_proj_run.add_argument("--verbose", "-v", action="store_true")
+    _add_mode_arg(p_proj_run)
+    p_proj_run.set_defaults(func=cmd_project_run)
 
     # ── sdk ───────────────────────────────────────────────────────────────────
-    p_sdk = sub.add_parser(
-        "sdk",
-        help="Manage Java installations via sdkman",
-        description="Manage Java installations via sdkman.",
-    )
+    p_sdk = sub.add_parser("sdk", help="Manage Java installations via sdkman")
     sdk_sub = p_sdk.add_subparsers(dest="sdk_command", metavar="<sdk-command>")
     sdk_sub.required = True
 
-    # sdk list
     p_sdk_list = sdk_sub.add_parser("list", help="List locally installed Java candidates")
     p_sdk_list.set_defaults(func=cmd_sdk_list)
 
-    # sdk install <id>
-    p_sdk_inst = sdk_sub.add_parser(
-        "install",
-        help="Install a Java candidate  (e.g. 24.0.2-tem)",
-    )
-    p_sdk_inst.add_argument("identifier", metavar="IDENTIFIER",
-        help="sdkman candidate identifier, e.g. 24.0.2-tem")
+    p_sdk_inst = sdk_sub.add_parser("install", help="Install a Java candidate (e.g. 24.0.2-tem)")
+    p_sdk_inst.add_argument("identifier", metavar="IDENTIFIER")
     p_sdk_inst.set_defaults(func=cmd_sdk_install)
 
-    # sdk use <id>
-    p_sdk_use = sdk_sub.add_parser(
-        "use",
-        help="Switch the active Java candidate for subsequent build commands",
-    )
-    p_sdk_use.add_argument("identifier", metavar="IDENTIFIER",
-        help="sdkman candidate identifier, e.g. 24.0.2-tem")
+    p_sdk_use = sdk_sub.add_parser("use", help="Switch the active Java candidate")
+    p_sdk_use.add_argument("identifier", metavar="IDENTIFIER")
     p_sdk_use.add_argument("--install", action="store_true",
-        help="Install the candidate first if it is not already available")
+        help="Install the candidate first if not already available")
     p_sdk_use.set_defaults(func=cmd_sdk_use)
 
     return parser
@@ -1451,7 +1351,5 @@ def main() -> None:
     args = parser.parse_args()
     sys.exit(args.func(args))
 
-
 if __name__ == "__main__":
     main()
-

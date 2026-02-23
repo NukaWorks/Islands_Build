@@ -29,20 +29,19 @@ versions from their own ``project.json`` and patches the matching
 ``<dependency>`` blocks in ``pom.xml`` so every project always uses the
 versions declared in their sibling manifests.
 
+Projects are discovered automatically by scanning the workspace root for
+sub-directories that contain both ``project.json`` and ``pom.xml``.  No
+project list needs to be hardcoded anywhere.
+
 ────────────────────────────────────────────────────────────────────────────
 Hook system
 ────────────────────────────────────────────────────────────────────────────
 A **Hook** is any callable ``(HookContext) -> HookResult``.
-Hooks are declared per-project in ``config.PROJECTS["hooks"]``::
 
-    "hooks": {
-        "pre_build":  [universal_prebuild],
-        "post_build": [],
-    }
-
-The universal hook ``universal_prebuild`` does everything:
+The universal hook ``universal_prebuild`` is applied automatically to every
+discovered project.  It does:
   1. Load ``project.json`` (if present).
-  2. Collect version map of all workspace projects.
+  2. Collect version map of all workspace projects (via scan).
   3. Patch ``pom.xml``:
        - ``<groupId>``, ``<artifactId>``, ``<version>`` of the project itself
        - ``<version>`` of every workspace dependency listed in the manifest
@@ -58,9 +57,7 @@ no pom override) so projects without manifests build normally.
 from __future__ import annotations
 
 import json
-import re
 import subprocess
-import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -149,6 +146,8 @@ class ProjectManifest:
     description:  str            = ""
     build:        dict           = field(default_factory=dict)
     workspace_deps: list[dict]   = field(default_factory=list)
+    artifact_name:  str          = ""   # optional override for the output jar filename
+    module:         dict         = field(default_factory=dict)  # ModularKit module descriptor
 
     # ── factories ──────────────────────────────────────────────────────────
 
@@ -187,6 +186,8 @@ class ProjectManifest:
             description  = data.get("description", ""),
             build        = data.get("build", {}),
             workspace_deps = data.get("workspace_dependencies", []),
+            artifact_name  = data.get("artifact_name", ""),
+            module         = data.get("module", {}),
         )
 
     @classmethod
@@ -221,6 +222,10 @@ class ProjectManifest:
             "build":       self.build,
             "workspace_dependencies": self.workspace_deps,
         }
+        if self.artifact_name:
+            data["artifact_name"] = self.artifact_name
+        if self.module:
+            data["module"] = self.module
         self.path.write_text(
             json.dumps(data, indent=2) + "\n", encoding="utf-8"
         )
@@ -232,6 +237,10 @@ class ProjectManifest:
 
     def is_application(self) -> bool:
         return self.project_type == "application"
+
+    def is_module(self) -> bool:
+        """Return True if this project has a ModularKit module descriptor."""
+        return bool(self.module)
 
     def effective_version(self, mode: str, commit_id: str) -> str:
         """
@@ -290,7 +299,7 @@ def _pretty_xml(root: ET.Element) -> str:
     dom  = minidom.parseString(raw.encode("utf-8"))
     lines = dom.toprettyxml(indent="    ", encoding=None).splitlines()
     # minidom re-adds a declaration; drop it (we already added one above)
-    lines = [l for l in lines if not l.startswith("<?xml")]
+    lines = [line_ for line_ in lines if not line_.startswith("<?xml")]
     result = '<?xml version="1.0" encoding="UTF-8"?>\n' + "\n".join(lines) + "\n"
     # Strip ns0: artifacts that ET occasionally emits
     result = result.replace("ns0:", "").replace(":ns0", "")
@@ -456,6 +465,94 @@ def universal_prebuild(ctx: HookContext) -> HookResult:
         pom_override=dest,
         message=f"pom override: {dest}",
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Manifest-change sync  (patch pom.xml in-place after project.json edits)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def sync_module_json(manifest: "ProjectManifest") -> bool:
+    """
+    Write ``src/main/resources/module.json`` from the ``module`` block of
+    *manifest*, injecting the current ``version`` so it stays in sync.
+
+    Does nothing and returns True if the manifest has no ``module`` block.
+    Returns False on write failure.
+    """
+    if not manifest.module:
+        return True
+
+    resources_dir = manifest.path.parent / "src" / "main" / "resources"
+    module_json_path = resources_dir / "module.json"
+
+    if not resources_dir.exists():
+        log.warn(f"sync_module_json: resources dir not found: {resources_dir}")
+        return False
+
+    data = dict(manifest.module)          # shallow copy
+    data["version"] = manifest.version    # keep version in sync
+
+    try:
+        import json as _json
+        module_json_path.write_text(
+            _json.dumps(data, indent=2) + "\n", encoding="utf-8"
+        )
+        log.success(f"  module.json synced → {module_json_path}")
+        return True
+    except Exception as exc:
+        log.error(f"sync_module_json failed for {manifest.name}: {exc}")
+        return False
+
+
+def sync_pom_versions(
+    project_dir: Path,
+    all_manifests: dict[str, "ProjectManifest"],
+    *,
+    mode: str = "local",
+    commit_id: str = "",
+) -> bool:
+    """
+    Patch ``pom.xml`` **in-place** (overwriting the real file, not a build
+    override) so that version numbers stay consistent with ``project.json``.
+
+    Unlike :func:`patch_pom`, this writes directly to ``pom.xml`` so the
+    canonical source of truth is always up-to-date after manifest edits.
+
+    Returns ``True`` on success, ``False`` if the pom is missing or an error
+    occurs.
+    """
+    manifest = all_manifests.get(
+        next(
+            (aid for aid, m in all_manifests.items() if m.path.parent == project_dir),
+            None,
+        )
+    )
+    if manifest is None:
+        # Try loading directly
+        try:
+            manifest = ProjectManifest.load(project_dir)
+        except ValueError:
+            manifest = None
+    if manifest is None:
+        return False
+
+    pom_path = project_dir / "pom.xml"
+    if not pom_path.exists():
+        return False
+
+    try:
+        patch_pom(
+            pom_path,
+            manifest,
+            all_manifests,
+            mode=mode,
+            commit_id=commit_id,
+            dest=pom_path,          # overwrite the real pom.xml
+        )
+        return True
+    except Exception as exc:
+        log.error(f"sync_pom_versions failed for {project_dir.name}: {exc}")
+        return False
 
 
 # ── Backwards-compat alias ─────────────────────────────────────────────────

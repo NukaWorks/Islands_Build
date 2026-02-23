@@ -3,12 +3,8 @@ High-level run configurations:
   - build_all_and_test  : build every project, run tests for each
   - build_and_run_islands: build all, assemble output dir, launch CoffeeLoader
 """
-import json
-import os
 import signal
 import subprocess
-import sys
-import time
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -63,14 +59,6 @@ def _check_artifact(project: dict) -> bool:
     return True
 
 
-def _resolve_hooks(project: dict) -> dict:
-    """Return the hooks dict for a project (supports lazy callable form)."""
-    hooks_entry = project.get("hooks", {})
-    if callable(hooks_entry):
-        return hooks_entry()
-    return hooks_entry or {}
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Run config 1 – build + test every project individually
 # ─────────────────────────────────────────────────────────────────────────────
@@ -80,17 +68,18 @@ def build_all_and_test(*, verbose: bool = False, java_version: Optional[str] = N
     Build every project in dependency order, running tests for each.
     Returns True only if all builds succeed.
     """
+    projects = cfg.get_projects()
     log.banner(
         "Build All & Test",
-        "ModularKit → CoffeeLoader → Islands  (tests enabled)",
+        f"{len(projects)} project(s) in dependency order  (tests enabled)",
     )
 
     env = _resolve_env(java_version)
     if env is None and cfg.JAVA_VERSION:
         return False   # resolution failed
 
-    total = len(cfg.PROJECTS)
-    for i, project in enumerate(cfg.PROJECTS, 1):
+    total = len(projects)
+    for i, project in enumerate(projects, 1):
         log.step(i, total, project["name"])
         ok = maven.build_project(
             project["name"],
@@ -114,10 +103,14 @@ def build_all_and_test(*, verbose: bool = False, java_version: Optional[str] = N
 
 def _assemble_output(*, clean: bool = False) -> bool:
     """
-    1. Create output/ and output/modules/
-    2. Copy CoffeeLoader fat-jar → output/
-    3. Copy Islands jar          → output/modules/
-    4. Write CoffeeLoader config → output/config.json
+    Assemble the output directory from all discovered projects.
+
+    Routing rules (in priority order):
+      - Has a ``module`` block in project.json  → output/modules/   (ModularKit module)
+      - application, no module block            → output/           (launcher / fat-jar)
+      - library                                 → output/           (classpath dep)
+
+    The first application project that is NOT a module is treated as the launcher.
     """
     log.section("Assembling output directory")
 
@@ -127,20 +120,46 @@ def _assemble_output(*, clean: bool = False) -> bool:
         fs.ensure_dir(cfg.OUTPUT_DIR)
         fs.ensure_dir(cfg.MODULES_DIR)
 
-    ok = fs.copy_artifact(cfg.COFFEELOADER_TARGET, cfg.COFFEELOADER_OUTPUT_JAR)
-    if not ok:
-        return False
+    projects = cfg.get_projects()
+    launcher_jar: Optional[Path] = None
 
-    ok = fs.copy_artifact(cfg.ISLANDS_TARGET, cfg.ISLANDS_MODULE_JAR)
-    if not ok:
-        return False
+    for project in projects:
+        art = project.get("artifact")
+        if not art:
+            continue
+        art = Path(art)
 
+        # Load manifest to check module block and project type
+        m = None
+        try:
+            from hooks import ProjectManifest
+            m = ProjectManifest.load(Path(project["dir"]))
+        except Exception:
+            pass
+
+        if m and m.is_module():
+            # ModularKit module → output/modules/
+            dest = cfg.MODULES_DIR / art.name
+            ok = fs.copy_artifact(art, dest)
+            if not ok:
+                return False
+        else:
+            # Launcher or library → output/
+            dest = cfg.OUTPUT_DIR / art.name
+            ok = fs.copy_artifact(art, dest)
+            if not ok:
+                return False
+            if m and m.is_application() and launcher_jar is None:
+                launcher_jar = dest
+
+    # Write CoffeeLoader-compatible config.json
     runtime_cfg = {
-        "port": cfg.COFFEELOADER_RUNTIME_CONFIG["port"],
+        "port":        cfg.COFFEELOADER_RUNTIME_CONFIG["port"],
         "fileWatcher": cfg.COFFEELOADER_RUNTIME_CONFIG["fileWatcher"],
-        "sources": [str(cfg.MODULES_DIR)],
+        "sources":     [str(cfg.MODULES_DIR)],
     }
     fs.write_json(cfg.OUTPUT_DIR / "config.json", runtime_cfg)
+    log.info(f"Module source: {cfg.MODULES_DIR}")
     return True
 
 
@@ -168,9 +187,10 @@ def build_and_run_islands(
     Pass clean=True to run 'mvn clean install' instead of just 'mvn install'.
     """
     effective_mode = mode or cfg.BUILD_MODE
+    projects = cfg.get_projects()
     log.banner(
         "Build & Run Islands",
-        f"ModularKit → CoffeeLoader → Islands  then launch  |  mode: {effective_mode}",
+        f"{len(projects)} project(s)  →  launch  |  mode: {effective_mode}",
     )
 
     env = _resolve_env(java_version)
@@ -180,15 +200,17 @@ def build_and_run_islands(
     if fast_build:
         log.info("--fast-build: skipping Maven build, using existing artifacts.")
     else:
-        total = len(cfg.PROJECTS)
-        for i, project in enumerate(cfg.PROJECTS, 1):
+        total = len(projects)
+        for i, project in enumerate(projects, 1):
             log.step(i, total, project["name"])
 
             # ── pre-build hooks ──────────────────────────────────────────────
-            hook_table = _resolve_hooks(project)
-            ctx = hooksmod.build_hook_context(project, mode=effective_mode, verbose=verbose)
+            ctx = hooksmod.build_hook_context(project, mode=effective_mode,
+                                              verbose=verbose, workspace_dir=cfg.WORKSPACE)
             ok, pom_override, extra_mvn_args = hooksmod.run_hooks(
-                "pre_build", hook_table.get("pre_build", []), ctx
+                "pre_build",
+                [hooksmod.universal_prebuild],
+                ctx,
             )
             if not ok:
                 log.error(f"Pre-build hook failed for: {project['name']}")
@@ -210,7 +232,7 @@ def build_and_run_islands(
                 return False
 
             # ── post-build hooks ─────────────────────────────────────────────
-            ok, _, _ = hooksmod.run_hooks("post_build", hook_table.get("post_build", []), ctx)
+            ok, _, _ = hooksmod.run_hooks("post_build", [], ctx)
             if not ok:
                 log.error(f"Post-build hook failed for: {project['name']}")
                 return False
@@ -222,16 +244,43 @@ def build_and_run_islands(
     return _launch_coffeeloader(java_opts=java_opts, env=env)
 
 
+def _find_launcher_jar() -> Optional[Path]:
+    """
+    Locate the first application-type project jar in the output directory.
+    Falls back to any .jar in output/ (not in output/modules/).
+    """
+    if not cfg.OUTPUT_DIR.exists():
+        return None
+    # Prefer jars that match an application artifact name
+    try:
+        from hooks import ProjectManifest
+        for project in cfg.get_projects():
+            m = ProjectManifest.load(Path(project["dir"]))
+            if m and m.project_type == "application":
+                candidate = cfg.OUTPUT_DIR / Path(project["artifact"]).name
+                if candidate.exists():
+                    return candidate
+    except Exception:
+        pass
+    # Fallback: any jar directly in output/ (not in modules/)
+    for jar in cfg.OUTPUT_DIR.glob("*.jar"):
+        return jar
+    return None
+
+
 def _launch_coffeeloader(
     *,
     java_opts: Optional[str] = None,
     env: Optional[Dict[str, str]] = None,
 ) -> bool:
-    jar = cfg.COFFEELOADER_OUTPUT_JAR
+    jar = _find_launcher_jar()
     config_file = cfg.OUTPUT_DIR / "config.json"
 
-    if not jar.exists():
-        log.error(f"CoffeeLoader jar not found: {jar}")
+    if jar is None or not jar.exists():
+        log.error(
+            f"No launcher jar found in {cfg.OUTPUT_DIR}. "
+            "Run 'build-all' first or check that an application project is configured."
+        )
         return False
 
     # Resolve the java binary: prefer the one from env's JAVA_HOME
@@ -249,8 +298,9 @@ def _launch_coffeeloader(
         "-jar", str(jar),
     ]
 
-    log.section("Launching CoffeeLoader")
-    log.info(f"Command: {' '.join(cmd)}")
+    log.section("Launching application")
+    log.info(f"Jar:         {jar.name}")
+    log.info(f"Command:     {' '.join(cmd)}")
     log.info(f"Working dir: {cfg.OUTPUT_DIR}")
     log.info("Press Ctrl+C to stop.\n")
 
@@ -259,14 +309,14 @@ def _launch_coffeeloader(
         proc = subprocess.Popen(cmd, cwd=cfg.OUTPUT_DIR, env=env)
         proc.wait()
     except KeyboardInterrupt:
-        log.warn("Interrupt received – stopping CoffeeLoader…")
+        log.warn("Interrupt received – stopping…")
         if proc:
             proc.send_signal(signal.SIGTERM)
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        log.info("CoffeeLoader stopped.")
+        log.info("Application stopped.")
     except FileNotFoundError:
         log.error(f"'{java_bin}' not found – please install a JDK and add it to PATH.")
         return False
