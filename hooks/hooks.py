@@ -504,6 +504,47 @@ def sync_module_json(manifest: "ProjectManifest") -> bool:
         return False
 
 
+def remove_pom_dependency(
+    project_dir: Path,
+    group_id: Optional[str],
+    artifact_id: str,
+) -> bool:
+    """
+    Remove a ``<dependency>`` block from ``pom.xml`` in *project_dir* whose
+    ``<artifactId>`` matches *artifact_id* (and optionally *group_id*).
+
+    Writes the result back to ``pom.xml`` in-place.
+    Returns ``True`` if a dependency was removed, ``False`` otherwise.
+    """
+    pom_path = project_dir / "pom.xml"
+    if not pom_path.exists():
+        return False
+
+    try:
+        tree = ET.parse(str(pom_path))
+        root = tree.getroot()
+
+        deps_root = root.find(_pom_tag("dependencies"))
+        if deps_root is None:
+            return False
+
+        removed = False
+        for dep_el in list(deps_root.findall(_pom_tag("dependency"))):
+            dep_aid = (dep_el.findtext(_pom_tag("artifactId")) or "").strip()
+            dep_gid = (dep_el.findtext(_pom_tag("groupId"))    or "").strip()
+            if dep_aid == artifact_id and (group_id is None or dep_gid == group_id):
+                deps_root.remove(dep_el)
+                removed = True
+                log.info(f"  removed <dependency> {dep_gid}:{dep_aid} from pom.xml")
+
+        if removed:
+            pom_path.write_text(_pretty_xml(root), encoding="utf-8")
+        return removed
+    except Exception as exc:
+        log.error(f"remove_pom_dependency failed for {project_dir.name}: {exc}")
+        return False
+
+
 def sync_pom_versions(
     project_dir: Path,
     all_manifests: dict[str, "ProjectManifest"],

@@ -11,11 +11,11 @@ Usage examples
   python build.py build-all --mode local             # strip GPG plugin (default on dev machines)
   python build.py build-all --mode devel             # strip GPG + append -nightly_<sha> version
   python build.py build-all --mode release           # full pom (GPG signing on)
-  python build.py run-islands                        # build all + assemble + launch
-  python build.py run-islands --fast-build           # skip build, assemble + launch existing artifacts
-  python build.py run-islands --clean                # mvn clean install + wipe output dir before launch
-  python build.py run-islands --with-tests --clean --verbose
-  python build.py run-islands --java-version 24.0.2-tem
+  python build.py run                                # build all + assemble + launch
+  python build.py run --fast-build                   # skip build, assemble + launch existing artifacts
+  python build.py run --clean                        # mvn clean install + wipe output dir before launch
+  python build.py run --with-tests --clean --verbose
+  python build.py run --java-version 24.0.2-tem
   python build.py assemble                           # only assemble output dir (no build)
   python build.py clean                              # wipe the output dir
   python build.py status                             # show project/artifact status
@@ -49,8 +49,8 @@ Usage examples
   python build.py project set ModularKit version 2.0.0
   python build.py project add-dep ModularKit works.nuka ModularKit
   python build.py project remove-dep Islands UiKit
-  python build.py project run ModularKit             # dry-run pre_build hooks
-  python build.py project run ModularKit --mode devel
+  python build.py project hook-init ModularKit             # dry-run pre_build hooks
+  python build.py project hook-init ModularKit --mode devel
 """
 
 import argparse
@@ -784,12 +784,17 @@ def cmd_project_add_dep(args: argparse.Namespace) -> int:
 
 
 def cmd_project_remove_dep(args: argparse.Namespace) -> int:
-    """Remove a workspace dependency from a project's project.json."""
+    """Remove a workspace dependency from a project's project.json and pom.xml."""
     project, manifest = _find_project_by_name(args.project)
     if manifest is None:
         return 1
 
     before = len(manifest.workspace_deps)
+    removed_deps = [
+        d for d in manifest.workspace_deps
+        if d["artifactId"] == args.artifact_id
+        and (args.group_id is None or d["groupId"] == args.group_id)
+    ]
     manifest.workspace_deps = [
         d for d in manifest.workspace_deps
         if not (
@@ -801,6 +806,17 @@ def cmd_project_remove_dep(args: argparse.Namespace) -> int:
         log.warn(f"Dependency '{args.artifact_id}' not found in {manifest.name}.")
         return 1
     manifest.save()
+
+    # Also remove the <dependency> block from pom.xml
+    dep_group_id = args.group_id or (removed_deps[0]["groupId"] if removed_deps else None)
+    pom_removed = hooksmod.remove_pom_dependency(
+        manifest.path.parent, dep_group_id, args.artifact_id
+    )
+    if pom_removed:
+        log.success(f"Removed <dependency> '{args.artifact_id}' from pom.xml of {manifest.name}")
+    else:
+        log.warn(f"Dependency '{args.artifact_id}' not found in pom.xml of {manifest.name} (may already be absent)")
+
     _sync_poms_after_manifest_change(manifest)
     log.success(f"Removed workspace dep '{args.artifact_id}' from {manifest.name}")
     print(manifest.path.read_text(encoding="utf-8"))
@@ -808,7 +824,7 @@ def cmd_project_remove_dep(args: argparse.Namespace) -> int:
 
 
 def cmd_project_run(args: argparse.Namespace) -> int:
-    """Dry-run pre-build hooks for a specific project (no Maven build)."""
+    """Dry-run pre-build hooks for a specific project (hook-init, no Maven build)."""
     mode   = args.mode or cfg.BUILD_MODE
     target = args.project
 
@@ -1089,9 +1105,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_mode_arg(p_build)
     p_build.set_defaults(func=cmd_build_all)
 
-    # ── run-islands ───────────────────────────────────────────────────────────
+    # ── run ───────────────────────────────────────────────────────────────────
     p_run = sub.add_parser(
-        "run-islands",
+        "run",
         help="Build all, assemble output dir, then launch Islands via CoffeeLoader",
         description=(
             "Full pipeline:\n"
@@ -1255,7 +1271,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  set    <PROJECT> <F> <V>   edit a manifest field\n"
             "  add-dep    <P> <G> <A>     add a workspace dependency\n"
             "  remove-dep <P> <A>         remove a workspace dependency\n"
-            "  run    <PROJECT>           dry-run pre_build hooks\n"
+            "  hook-init  <PROJECT>       dry-run pre_build hooks\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1312,7 +1328,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_proj_rmdep.add_argument("--group-id",  metavar="GROUP_ID", default=None, dest="group_id")
     p_proj_rmdep.set_defaults(func=cmd_project_remove_dep)
 
-    p_proj_run = proj_sub.add_parser("run",
+    p_proj_run = proj_sub.add_parser("hook-init",
         help="Dry-run pre_build hooks for a project (no Maven build)")
     p_proj_run.add_argument("project", metavar="PROJECT")
     p_proj_run.add_argument("--phase", metavar="PHASE", default="pre_build",
