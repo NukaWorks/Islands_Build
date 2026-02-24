@@ -449,7 +449,17 @@ class _AppProcess:
         log.info("[watch] Relaunching application…")
         self._stop_proc()
         if self._thread:
-            self._thread.join(timeout=8)
+            self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                # Thread is still blocked — force-kill proc and give up waiting
+                log.warn("[watch] Thread still alive after stop — force-killing")
+                with self._lock:
+                    proc = self._proc
+                if proc:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
 
         cmd = self._build_cmd()
         if cmd is None:
@@ -466,20 +476,41 @@ class _AppProcess:
         """Terminate gracefully, then wait for the thread."""
         self._stop_proc()
         if self._thread:
-            self._thread.join(timeout=8)
+            self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                log.warn("[watch] Thread still alive after stop — force-killing")
+                with self._lock:
+                    proc = self._proc
+                if proc:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
 
     def is_alive(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def _stop_proc(self) -> None:
+    def _stop_proc(self, *, timeout_term: float = 3.0) -> None:
+        """
+        Send SIGTERM; if the process hasn't exited within *timeout_term*
+        seconds escalate to SIGKILL so the caller never blocks indefinitely.
+        """
         with self._lock:
             proc = self._proc
-        if proc and proc.poll() is None:
+        if proc is None or proc.poll() is not None:
+            return
+        try:
             proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=timeout_term)
+        except subprocess.TimeoutExpired:
+            log.warn("[watch] Process did not stop on SIGTERM — sending SIGKILL")
             try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
                 proc.kill()
+                proc.wait(timeout=3.0)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -691,19 +722,17 @@ def watch_and_run(
                 all_rebuilt_aids, all_manifests
             )
 
-            # Collect source UUIDs that need quiescing (module jars only —
-            # launcher / library changes require a full relaunch anyway, so
-            # no point quiescing them through the API).
-            module_source_uuids = [
-                modLoader_src_uuid
-                for aid in all_rebuilt_aids
-                if (m := all_manifests.get(aid)) and m.module
-                for modLoader_src_uuid in [None]  # resolved at runtime by CoffeeLoader
-            ] if not needs_relaunch else []
-
             if not needs_relaunch:
-                # Hot-swap path: quiesce modules → assemble → signal complete
-                bridge.prepare_rebuild(source_uuids=[], module_uuids=[])
+                # Hot-swap path: collect module UUIDs from affected manifests,
+                # quiesce them in CoffeeLoader, replace JARs, then signal done.
+                module_uuids = [
+                    m.module["uuid"]
+                    for aid in all_rebuilt_aids
+                    if (m := all_manifests.get(aid))
+                    and m.module
+                    and m.module.get("uuid")
+                ]
+                bridge.prepare_rebuild(source_uuids=[], module_uuids=module_uuids)
                 runnermod._assemble_output(clean=False)
                 bridge.rebuild_complete(source_uuids=[])
                 log.success("[watch] Rebuild complete — hot-swap triggered.")
@@ -722,8 +751,28 @@ def watch_and_run(
     finally:
         # ── Step 5: shutdown ───────────────────────────────────────────────
         log.info("\n[watch] Shutting down…")
-        app.stop()
-        log.info("[watch] Done.")
+        # Restore default signal handlers before stopping so SIGINT/SIGTERM
+        # during shutdown don't re-enter our handler.
+        try:
+            signal.signal(signal.SIGINT,  signal.SIG_DFL)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        except Exception:
+            pass
+        # Hard deadline: if app.stop() hangs, force-kill after 6 s total.
+        t0 = time.time()
+        stop_thread = threading.Thread(target=app.stop, daemon=True, name="stop")
+        stop_thread.start()
+        stop_thread.join(timeout=6)
+        if stop_thread.is_alive():
+            log.warn("[watch] Force-stopping hung process…")
+            with app._lock:
+                proc = app._proc
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        log.info(f"[watch] Done. ({time.time() - t0:.1f}s)")
 
     return True
 
