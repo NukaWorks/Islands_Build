@@ -153,13 +153,18 @@ def _assemble_output(*, clean: bool = False) -> bool:
             if m and m.is_application() and launcher_jar is None:
                 launcher_jar = dest
 
-    # Write CoffeeLoader-compatible config.json
-    runtime_cfg = {
-        "port":        cfg.COFFEELOADER_RUNTIME_CONFIG["port"],
-        "fileWatcher": cfg.COFFEELOADER_RUNTIME_CONFIG["fileWatcher"],
-        "sources":     [str(cfg.MODULES_DIR)],
-    }
-    fs.write_json(cfg.OUTPUT_DIR / "config.json", runtime_cfg)
+        # Run any copy_config hooks declared in this project's manifest so
+        # output/config.json is always present even on --fast-build / assemble.
+        if m is not None:
+            named = hooksmod._resolve_named_hooks(m, "pre_build")
+            for hook_fn in named:
+                if hook_fn is hooksmod.copy_config_prebuild:
+                    ctx = hooksmod.build_hook_context(project, workspace_dir=cfg.WORKSPACE)
+                    result = hook_fn(ctx)
+                    if not result.success:
+                        log.error(f"copy_config hook failed for {project['name']}: {result.message}")
+                        return False
+
     log.info(f"Module source: {cfg.MODULES_DIR}")
     return True
 

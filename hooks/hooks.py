@@ -460,6 +460,21 @@ def universal_prebuild(ctx: HookContext) -> HookResult:
         return HookResult(success=False, message=f"pom patching failed: {exc}")
 
     log.success(f"[{ctx.project_name}] pom patched → {dest.name}")
+
+    # ── run manifest-declared named hooks ────────────────────────────────
+    named = _resolve_named_hooks(manifest, "pre_build")
+    for hook_fn in named:
+        hook_name = getattr(hook_fn, "__name__", repr(hook_fn))
+        log.info(f"[{ctx.project_name}] pre_build (manifest) → {hook_name}")
+        try:
+            named_result = hook_fn(ctx)
+        except Exception as exc:
+            return HookResult(success=False, message=f"hook '{hook_name}' raised: {exc}")
+        if named_result.message:
+            (log.info if named_result.success else log.error)(f"  → {named_result.message}")
+        if not named_result.success:
+            return HookResult(success=False, message=f"hook '{hook_name}' failed")
+
     return HookResult(
         success=True,
         pom_override=dest,
@@ -755,6 +770,90 @@ def modularkit_prebuild(ctx: HookContext) -> HookResult:
     Now delegates to ``universal_prebuild``.
     """
     return universal_prebuild(ctx)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Named hooks  (declared in project.json → "build" → "hooks" → "pre_build")
+# ══════════════════════════════════════════════════════════════════════════════
+
+def copy_config_prebuild(ctx: HookContext) -> HookResult:
+    """
+    Pre-build hook: copy the project's ``config.json`` into the workspace
+    output directory, overwriting the ``sources`` field so it always points
+    at the runtime ``output/modules`` directory.
+
+    Configured via the project's ``build.hooks.copy_config`` block::
+
+        "build": {
+          "hooks": {
+            "pre_build": ["copy_config"]
+          },
+          "copy_config": {
+            "src":  "config.json"   // relative to project root (default)
+          }
+        }
+
+    The destination is always ``<workspace>/output/config.json``.
+    The ``sources`` field is overwritten with ``["<workspace>/output/modules"]``.
+    """
+    import fs as _fs
+
+    # Resolve workspace
+    workspace = ctx.workspace_dir
+    if workspace is None:
+        try:
+            import config as _cfg
+            workspace = _cfg.WORKSPACE
+        except ImportError:
+            workspace = ctx.project_dir.parent
+
+    # Read optional per-project copy_config settings from build block
+    try:
+        manifest = ProjectManifest.load(ctx.project_dir)
+    except ValueError as exc:
+        return HookResult(success=False, message=str(exc))
+
+    copy_cfg: dict = {}
+    if manifest is not None:
+        copy_cfg = manifest.build.get("copy_config", {})
+
+    src_rel = copy_cfg.get("src", "config.json")
+    src = ctx.project_dir / src_rel
+    dst = workspace / "output" / "config.json"
+    modules_dir = str(workspace / "output" / "modules")
+
+    ok = _fs.copy_config(src, dst, sources_override=[modules_dir])
+    if not ok:
+        return HookResult(success=False, message=f"copy_config: failed to copy {src} → {dst}")
+
+    return HookResult(success=True, message=f"copy_config: {src.name} → {dst}")
+
+
+# ── Registry: hook name (as declared in project.json) → callable ──────────
+NAMED_HOOKS: dict[str, Hook] = {
+    "copy_config": copy_config_prebuild,
+}
+
+
+def _resolve_named_hooks(manifest: "ProjectManifest", phase: str) -> list[Hook]:
+    """
+    Return the list of Hook callables declared in *manifest*'s
+    ``build.hooks.<phase>`` array, resolving names via :data:`NAMED_HOOKS`.
+
+    Unknown names are warned and skipped.
+    """
+    names: list[str] = []
+    if manifest is not None:
+        names = manifest.build.get("hooks", {}).get(phase, [])
+
+    hooks_out: list[Hook] = []
+    for name in names:
+        fn = NAMED_HOOKS.get(name)
+        if fn is None:
+            log.warn(f"Unknown hook name '{name}' declared in project.json — skipped.")
+        else:
+            hooks_out.append(fn)
+    return hooks_out
 
 
 # ══════════════════════════════════════════════════════════════════════════════

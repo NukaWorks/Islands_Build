@@ -4,7 +4,7 @@ File-system helpers: copy artifacts, create the output layout, write config.
 import json
 import shutil
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import logger as log
 
@@ -30,6 +30,39 @@ def write_json(path: Path, data: Dict[str, Any]) -> None:
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2)
     log.success(f"Wrote config: {path}")
+
+
+def copy_config(
+    src: Path,
+    dst: Path,
+    *,
+    sources_override: Optional[List[str]] = None,
+) -> bool:
+    """
+    Copy *src* ``config.json`` to *dst*, optionally replacing the ``sources``
+    field with *sources_override* so the runtime always points at the correct
+    modules directory.
+
+    Returns True on success, False if *src* does not exist or cannot be read.
+    """
+    if not src.exists():
+        log.error(f"Source config not found: {src}")
+        return False
+    try:
+        with open(src, "r", encoding="utf-8") as fh:
+            data: Dict[str, Any] = json.load(fh)
+    except (json.JSONDecodeError, OSError) as exc:
+        log.error(f"Failed to read source config {src}: {exc}")
+        return False
+
+    if sources_override is not None:
+        data["sources"] = sources_override
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with open(dst, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    log.success(f"Copied config  {src.name}  →  {dst}")
+    return True
 
 
 def clean_output(output_dir: Path) -> None:
