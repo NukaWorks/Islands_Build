@@ -596,6 +596,158 @@ def sync_pom_versions(
         return False
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Root POM sync  (keeps <modules> in the workspace root pom.xml up-to-date)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def sync_root_pom(
+    workspace_dir: Path,
+    all_manifests: Optional[dict[str, "ProjectManifest"]] = None,
+    *,
+    root_pom_path: Optional[Path] = None,
+) -> bool:
+    """
+    Regenerate the ``<modules>`` section of the workspace root ``pom.xml``
+    so that it always reflects the projects discovered via ``project.json``
+    files, listed in topological (dependency) order.
+
+    The function:
+
+    1. Discovers / reuses *all_manifests* (``{artifactId: ProjectManifest}``).
+    2. Performs a topological sort of the projects by their
+       ``workspace_dependencies`` — projects with no deps come first.
+    3. Reads the existing root ``pom.xml``, replaces **only** the
+       ``<modules>`` block (all other content is preserved).
+    4. Writes the result back to ``root_pom_path``
+       (default: ``workspace_dir / "pom.xml"``).
+
+    Returns ``True`` on success, ``False`` on any error.
+
+    Parameters
+    ----------
+    workspace_dir:
+        Absolute path to the workspace root directory.
+    all_manifests:
+        Optional pre-built manifest map.  When *None* the function scans
+        *workspace_dir* for ``project.json`` files automatically.
+    root_pom_path:
+        Path to the root ``pom.xml``.  Defaults to
+        ``workspace_dir / "pom.xml"``.
+    """
+    root_pom_path = root_pom_path or (workspace_dir / "pom.xml")
+    if not root_pom_path.exists():
+        log.warn(f"sync_root_pom: root pom not found at {root_pom_path}")
+        return False
+
+    # ── 1. Collect manifests ──────────────────────────────────────────────
+    if all_manifests is None:
+        all_manifests = {}
+        for entry in sorted(workspace_dir.iterdir()):
+            if not entry.is_dir():
+                continue
+            if entry.name.startswith(".") or entry.name in {"Build", "output"}:
+                continue
+            try:
+                m = ProjectManifest.load(entry)
+            except ValueError:
+                m = None
+            if m is not None:
+                all_manifests[m.artifact_id] = m
+
+    if not all_manifests:
+        log.warn("sync_root_pom: no project manifests found – root pom unchanged")
+        return True
+
+    # ── 2. Topological sort ───────────────────────────────────────────────
+    ordered: list[str] = []
+    visited: set[str]  = set()
+    visiting: set[str] = set()
+
+    def _visit(aid: str) -> None:
+        if aid in visited:
+            return
+        if aid in visiting:
+            return   # cycle – skip gracefully
+        visiting.add(aid)
+        m = all_manifests.get(aid)
+        if m:
+            for dep in m.workspace_deps:
+                dep_aid = dep.get("artifactId", "")
+                if dep_aid in all_manifests:
+                    _visit(dep_aid)
+        visiting.discard(aid)
+        visited.add(aid)
+        ordered.append(aid)
+
+    for aid in sorted(all_manifests.keys()):
+        _visit(aid)
+
+    # Module names are the sub-directory names (manifest path parent basename)
+    module_names = [
+        all_manifests[aid].path.parent.name for aid in ordered
+    ]
+
+    # ── 3. Patch the root pom.xml with a regex-based replace ─────────────
+    # We use a text-level replacement to avoid the whitespace noise that
+    # minidom round-tripping introduces into an already-formatted file.
+    import re as _re
+
+    try:
+        original = root_pom_path.read_text(encoding="utf-8")
+
+        # Detect indentation from the <module> tag — ignore blank-only lines
+        indent_match = _re.search(r'^([ \t]+)<module>', original, _re.MULTILINE)
+        module_indent = indent_match.group(1) if indent_match else "        "
+        # The <modules> container is one indent level up (4 spaces)
+        outer_indent = module_indent[:-4] if len(module_indent) >= 4 else "    "
+
+        new_modules_block = (
+            f"{outer_indent}<modules>\n"
+            + "".join(f"{module_indent}<module>{n}</module>\n" for n in module_names)
+            + f"{outer_indent}</modules>"
+        )
+
+        # Replace an existing <modules>…</modules> block (including multiline,
+        # allowing for any leading whitespace on the opening tag line)
+        new_content, n_subs = _re.subn(
+            r'[ \t]*<modules>.*?</modules>',
+            new_modules_block,
+            original,
+            flags=_re.DOTALL,
+        )
+
+        if n_subs == 0:
+            # No existing block — insert after <packaging> or <name> or <version>
+            for anchor_tag in ("packaging", "name", "version", "artifactId"):
+                pattern = rf'([ \t]*<{anchor_tag}>[^<]*</{anchor_tag}>)'
+                new_content, n_subs = _re.subn(
+                    pattern,
+                    rf'\1\n{new_modules_block}',
+                    original,
+                    count=1,
+                )
+                if n_subs:
+                    break
+
+        if n_subs == 0:
+            log.warn("sync_root_pom: could not locate insertion point — appending before </project>")
+            new_content = original.replace(
+                "</project>",
+                f"{new_modules_block}\n</project>",
+                1,
+            )
+
+        root_pom_path.write_text(new_content, encoding="utf-8")
+        log.success(
+            "root pom.xml <modules> synced: "
+            + " → ".join(module_names)
+        )
+        return True
+    except Exception as exc:
+        log.error(f"sync_root_pom failed: {exc}")
+        return False
+
+
 # ── Backwards-compat alias ─────────────────────────────────────────────────
 def modularkit_prebuild(ctx: HookContext) -> HookResult:
     """

@@ -43,6 +43,8 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -211,7 +213,167 @@ def _rebuild_projects(
     return True
 
 
-# ──────────────────────────────────────────���──────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CoffeeLoader REST API bridge
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _read_coffeeloader_api_config() -> dict:
+    """
+    Read ``output/config.json`` and return a dict with keys:
+      port     – int, default 8080
+      apiKeys  – list[str], first non-empty entry used for auth
+      jwtSecret – str (not used directly; token obtained via /api/auth/token)
+    """
+    config_file = cfg.OUTPUT_DIR / "config.json"
+    try:
+        data = json.loads(config_file.read_text(encoding="utf-8"))
+        return {
+            "port": int(data.get("port", 8080)),
+            "apiKeys": data.get("apiKeys", []),
+        }
+    except Exception:
+        return {"port": 8080, "apiKeys": []}
+
+
+class _WatcherBridge:
+    """
+    Thin HTTP client that calls CoffeeLoader's /api/watcher/* endpoints
+    before and after a JAR replacement to prevent ModularKit from reading
+    a partially-written file.
+
+    Usage::
+        bridge = _WatcherBridge()
+        bridge.prepare_rebuild(module_uuids=[...], source_uuids=[...])
+        # … replace JARs …
+        bridge.rebuild_complete(source_uuids=[...])
+
+    All calls are best-effort: if CoffeeLoader is not running (e.g. during
+    a full relaunch) the bridge silently skips the call.
+    """
+
+    _TOKEN_TTL = 3500  # refresh token after ~58 min (token valid for 24 h)
+
+    def __init__(self) -> None:
+        self._base_url: str = ""
+        self._api_key:  str = ""
+        self._token:    str = ""
+        self._token_ts: float = 0.0
+
+    # ── configuration ─────────────────────────────────────────────────────
+
+    def configure(self) -> None:
+        """Re-read output/config.json to pick up port / apiKey."""
+        api_cfg = _read_coffeeloader_api_config()
+        self._base_url = f"http://localhost:{api_cfg['port']}"
+        keys = [k for k in api_cfg.get("apiKeys", []) if k]
+        self._api_key = keys[0] if keys else ""
+        self._token   = ""       # force re-auth on next call
+        self._token_ts = 0.0
+
+    # ── auth ──────────────────────────────────────────────────────────────
+
+    def _ensure_token(self) -> bool:
+        """Obtain / refresh a JWT token. Returns False if no API key is set."""
+        if not self._api_key:
+            return False
+        if self._token and (time.time() - self._token_ts) < self._TOKEN_TTL:
+            return True
+        try:
+            body = json.dumps({"apiKey": self._api_key}).encode()
+            req  = urllib.request.Request(
+                f"{self._base_url}/api/auth/token",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                self._token    = data.get("token", "")
+                self._token_ts = time.time()
+                return bool(self._token)
+        except Exception as exc:
+            log.warn(f"[bridge] Auth failed: {exc}")
+            return False
+
+    # ── low-level POST ─────────────────────────────────────────────────────
+
+    def _post(self, path: str, payload: dict) -> Optional[dict]:
+        if not self._base_url:
+            self.configure()
+        if not self._ensure_token():
+            return None
+        try:
+            body = json.dumps(payload).encode()
+            req  = urllib.request.Request(
+                f"{self._base_url}{path}",
+                data=body,
+                headers={
+                    "Content-Type":  "application/json",
+                    "Authorization": f"Bearer {self._token}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.URLError:
+            # CoffeeLoader not reachable — not an error during relaunch
+            return None
+        except Exception as exc:
+            log.warn(f"[bridge] POST {path} failed: {exc}")
+            return None
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def prepare_rebuild(
+        self,
+        *,
+        module_uuids: Optional[List[str]] = None,
+        source_uuids: Optional[List[str]] = None,
+    ) -> bool:
+        """
+        Stop + unload the listed modules/sources so CoffeeLoader won't read
+        the JAR files while they are being replaced on disk.
+
+        Returns True when CoffeeLoader confirmed the quiesce; False if the
+        server was unreachable (safe to proceed — full relaunch will follow).
+        """
+        payload: dict = {
+            "moduleUuids": module_uuids or [],
+            "sourceUuids": source_uuids or [],
+        }
+        result = self._post("/api/watcher/prepare-rebuild", payload)
+        if result is None:
+            return False
+        errors = result.get("errors", [])
+        if errors:
+            log.warn(f"[bridge] prepare-rebuild errors: {errors}")
+        stopped  = result.get("stopped",  [])
+        unloaded = result.get("unloaded", [])
+        if stopped or unloaded:
+            log.info(f"[bridge] stopped={stopped}  unloaded={unloaded}")
+        return True
+
+    def rebuild_complete(self, *, source_uuids: Optional[List[str]] = None) -> bool:
+        """
+        Signal that new JARs are in place so CoffeeLoader can restart the
+        modules that were quiesced by prepare_rebuild.
+
+        Returns True on success; False if the server was unreachable.
+        """
+        payload: dict = {"sourceUuids": source_uuids or []}
+        result = self._post("/api/watcher/rebuild-complete", payload)
+        if result is None:
+            return False
+        errors    = result.get("errors",    [])
+        restarted = result.get("restarted", [])
+        if errors:
+            log.warn(f"[bridge] rebuild-complete errors: {errors}")
+        if restarted:
+            log.info(f"[bridge] restarted={restarted}")
+        return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Restartable CoffeeLoader process wrapper
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -445,6 +607,10 @@ def watch_and_run(
     # Give the JVM a moment to start
     time.sleep(1.5)
 
+    # Initialise the REST API bridge (best-effort; no API key = no-op)
+    bridge = _WatcherBridge()
+    bridge.configure()
+
     # ── Step 4: watch loop ─────────────────────────────────────────────────
     log.section("Watching for changes  (Ctrl+C to stop)")
 
@@ -525,17 +691,33 @@ def watch_and_run(
                 all_rebuilt_aids, all_manifests
             )
 
-            # Re-assemble output/ in all cases so the right jars are in place
-            runnermod._assemble_output(clean=False)
+            # Collect source UUIDs that need quiescing (module jars only —
+            # launcher / library changes require a full relaunch anyway, so
+            # no point quiescing them through the API).
+            module_source_uuids = [
+                modLoader_src_uuid
+                for aid in all_rebuilt_aids
+                if (m := all_manifests.get(aid)) and m.module
+                for modLoader_src_uuid in [None]  # resolved at runtime by CoffeeLoader
+            ] if not needs_relaunch else []
 
-            if needs_relaunch:
+            if not needs_relaunch:
+                # Hot-swap path: quiesce modules → assemble → signal complete
+                bridge.prepare_rebuild(source_uuids=[], module_uuids=[])
+                runnermod._assemble_output(clean=False)
+                bridge.rebuild_complete(source_uuids=[])
+                log.success("[watch] Rebuild complete — hot-swap triggered.")
+            else:
+                # Relaunch path: CoffeeLoader will be killed anyway, so
+                # just assemble then restart the process.
+                runnermod._assemble_output(clean=False)
                 log.info("[watch] Restart required — relaunching CoffeeLoader…")
                 app.restart()
+                # Re-configure bridge for new process (port may be same, but
+                # forces fresh token on next hot-swap cycle).
+                bridge.configure()
                 # Give the fresh JVM a moment before the next poll
                 time.sleep(1.5)
-            else:
-                # Pure hot-swap: CoffeeLoader fileWatcher picks up the new jars
-                log.success("[watch] Rebuild complete — hot-swap triggered.")
 
     finally:
         # ── Step 5: shutdown ───────────────────────────────────────────────

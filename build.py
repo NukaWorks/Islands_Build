@@ -55,6 +55,7 @@ Usage examples
   python build.py project set ModularKit version 2.0.0
   python build.py project add-dep ModularKit works.nuka ModularKit
   python build.py project remove-dep Islands UiKit
+  python build.py project sync-root-pom              # regenerate root pom.xml <modules>
   python build.py project hook-init ModularKit             # dry-run pre_build hooks
   python build.py project hook-init ModularKit --mode devel
 """
@@ -823,7 +824,37 @@ def cmd_project_init(args: argparse.Namespace) -> int:
 
     # Invalidate the project cache so subsequent commands see the new project
     cfg._projects_cache = None
+
+    # Sync root pom.xml so the new module appears in <modules>
+    _sync_root_pom_from_workspace()
     return 0
+
+
+def _sync_root_pom_from_workspace() -> bool:
+    """
+    Rebuild the ``<modules>`` section of the workspace root ``pom.xml``
+    from the projects currently discovered in the workspace.
+
+    This is the lightweight entry-point used by ``project init`` and
+    ``project sync-root-pom``.  It rescans the workspace on every call
+    (no cache) so it always reflects the current state on disk.
+
+    Returns ``True`` on success.
+    """
+    cfg._projects_cache = None   # ensure fresh scan
+    all_manifests: dict = {}
+    for entry in sorted(cfg.WORKSPACE.iterdir()):
+        if not entry.is_dir():
+            continue
+        if entry.name.startswith(".") or entry.name in {"Build", "output"}:
+            continue
+        try:
+            m = hooksmod.ProjectManifest.load(entry)
+        except ValueError:
+            m = None
+        if m is not None:
+            all_manifests[m.artifact_id] = m
+    return hooksmod.sync_root_pom(cfg.WORKSPACE, all_manifests)
 
 
 def _sync_poms_after_manifest_change(changed_manifest: "hooksmod.ProjectManifest") -> None:
@@ -869,6 +900,9 @@ def _sync_poms_after_manifest_change(changed_manifest: "hooksmod.ProjectManifest
 
     if patched:
         log.success(f"pom.xml synced: {', '.join(patched)}")
+
+    # Regenerate root pom.xml <modules> to reflect any structural changes
+    hooksmod.sync_root_pom(cfg.WORKSPACE, all_manifests)
 
 
 def cmd_project_set(args: argparse.Namespace) -> int:
@@ -969,6 +1003,24 @@ def cmd_project_remove_dep(args: argparse.Namespace) -> int:
     log.success(f"Removed workspace dep '{args.artifact_id}' from {manifest.name}")
     print(manifest.path.read_text(encoding="utf-8"))
     return 0
+
+
+def cmd_project_sync_root_pom(args: argparse.Namespace) -> int:
+    """
+    Regenerate the ``<modules>`` block of the workspace root ``pom.xml``
+    from the projects currently present in the workspace (as declared in
+    their ``project.json`` files, sorted in dependency order).
+
+    This is useful after manually adding, removing, or renaming a project
+    directory without going through the build CLI.
+    """
+    log.banner("Sync Root POM", str(cfg.WORKSPACE / "pom.xml"))
+    ok = _sync_root_pom_from_workspace()
+    if ok:
+        log.success("Root pom.xml <modules> is up-to-date.")
+    else:
+        log.error("Failed to sync root pom.xml.")
+    return 0 if ok else 1
 
 
 def cmd_project_run(args: argparse.Namespace) -> int:
@@ -1150,8 +1202,56 @@ def cmd_idea(args: argparse.Namespace) -> int:
                                      **{"inherit-compiler-output": "true"})
         ET.SubElement(root_mgr_el, "exclude-output")
         content = ET.SubElement(root_mgr_el, "content", url="file://$MODULE_DIR$")
-        if (project_dir / "pom.xml").exists():
+
+        has_pom = (project_dir / "pom.xml").exists()
+
+        # ── source folders ────────────────────────────────────────────────────
+        # Main sources
+        main_java = project_dir / "src" / "main" / "java"
+        if main_java.exists():
+            ET.SubElement(content, "sourceFolder",
+                          url="file://$MODULE_DIR$/src/main/java",
+                          isTestSource="false")
+
+        # Main resources
+        main_res = project_dir / "src" / "main" / "resources"
+        if main_res.exists():
+            ET.SubElement(content, "sourceFolder",
+                          url="file://$MODULE_DIR$/src/main/resources",
+                          type="java-resource")
+
+        # Test sources – read custom <testSourceDirectory> from pom.xml if present
+        test_src_rel = "src/test/java"  # Maven default
+        if has_pom:
+            try:
+                pom_tree = ET.parse(project_dir / "pom.xml")
+                pom_root = pom_tree.getroot()
+                ns = {"m": "http://maven.apache.org/POM/4.0.0"}
+                # Try with namespace first, then without
+                tsd = pom_root.find(".//m:testSourceDirectory", ns)
+                if tsd is None:
+                    tsd = pom_root.find(".//testSourceDirectory")
+                if tsd is not None and tsd.text:
+                    test_src_rel = tsd.text.strip()
+            except ET.ParseError:
+                pass
+
+        test_src = project_dir / test_src_rel
+        if test_src.exists():
+            ET.SubElement(content, "sourceFolder",
+                          url=f"file://$MODULE_DIR$/{test_src_rel}",
+                          isTestSource="true")
+
+        # Test resources (standard Maven layout only)
+        test_res = project_dir / "src" / "test" / "resources"
+        if test_res.exists():
+            ET.SubElement(content, "sourceFolder",
+                          url="file://$MODULE_DIR$/src/test/resources",
+                          type="java-test-resource")
+
+        if has_pom:
             ET.SubElement(content, "excludeFolder", url="file://$MODULE_DIR$/target")
+
         ET.SubElement(root_mgr_el, "orderEntry", type="inheritedJdk")
         ET.SubElement(root_mgr_el, "orderEntry", type="sourceFolder", forTests="false")
         iml_path.write_text(_pretty_xml(iml_el), encoding="utf-8")
@@ -1455,6 +1555,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  set    <PROJECT> <F> <V>   edit a manifest field\n"
             "  add-dep    <P> <G> <A>     add a workspace dependency\n"
             "  remove-dep <P> <A>         remove a workspace dependency\n"
+            "  sync-root-pom              regenerate root pom.xml <modules>\n"
             "  hook-init  <PROJECT>       dry-run pre_build hooks\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1511,6 +1612,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_proj_rmdep.add_argument("artifact_id", metavar="ARTIFACT_ID")
     p_proj_rmdep.add_argument("--group-id",  metavar="GROUP_ID", default=None, dest="group_id")
     p_proj_rmdep.set_defaults(func=cmd_project_remove_dep)
+
+    p_proj_sync_root = proj_sub.add_parser(
+        "sync-root-pom",
+        help="Regenerate the root pom.xml <modules> block from workspace projects",
+        description=(
+            "Scans the workspace for project.json files and rewrites the\n"
+            "<modules> section of the root pom.xml in topological dependency\n"
+            "order.  All other root pom.xml content is preserved.\n\n"
+            "This command is called automatically by:\n"
+            "  project init       (when creating a new project)\n"
+            "  project set        (after changing a manifest field)\n"
+            "  project add-dep    (after adding a dependency)\n"
+            "  project remove-dep (after removing a dependency)\n\n"
+            "Run it manually after adding/removing a project directory\n"
+            "outside the CLI."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_proj_sync_root.set_defaults(func=cmd_project_sync_root_pom)
 
     p_proj_run = proj_sub.add_parser("hook-init",
         help="Dry-run pre_build hooks for a project (no Maven build)")

@@ -13,6 +13,7 @@ from hooks.hooks import (
     sync_module_json,
     remove_pom_dependency,
     sync_pom_versions,
+    sync_root_pom,
     run_hooks,
     build_hook_context,
 )
@@ -29,7 +30,10 @@ __all__ = [
     "sync_module_json",
     "remove_pom_dependency",
     "sync_pom_versions",
+    "sync_root_pom",
     "run_hooks",
     "build_hook_context",
 ]
+
+
 
