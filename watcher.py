@@ -420,12 +420,28 @@ class _AppProcess:
         return cmd
 
     def _run(self, cmd: List[str]) -> None:
+        # Keep a local reference so this thread's wait() is not affected
+        # by self._proc being replaced during a restart.
         try:
+            import os
             with self._lock:
-                self._proc = subprocess.Popen(cmd, cwd=cfg.OUTPUT_DIR, env=self.env)
-            self._proc.wait()
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=cfg.OUTPUT_DIR,
+                    env=self.env,
+                    stdout=None,
+                    stderr=None,
+                    start_new_session=True,   # own process group → SIGKILL hits group
+                )
+                self._proc = proc
+            # Poll instead of blocking wait() — this lets stop()/restart()
+            # reliably kill the thread via _stop_proc() + thread.join()
+            while proc.poll() is None:
+                time.sleep(0.25)
         except FileNotFoundError:
             log.error(f"[watch] java not found: {cmd[0]}")
+        except Exception:
+            pass
 
     # ── public ────────────────────────────────────────────────────────────
 
@@ -448,18 +464,19 @@ class _AppProcess:
         """Stop the current process and launch a fresh one."""
         log.info("[watch] Relaunching application…")
         self._stop_proc()
-        if self._thread:
+        if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
-            if self._thread.is_alive():
-                # Thread is still blocked — force-kill proc and give up waiting
-                log.warn("[watch] Thread still alive after stop — force-killing")
-                with self._lock:
-                    proc = self._proc
-                if proc:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+        if self._thread and self._thread.is_alive():
+            # Thread still blocked — force-kill and wait again with a hard cap
+            log.warn("[watch] Thread still alive after restart stop — force-killing")
+            with self._lock:
+                proc = self._proc
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            self._thread.join(timeout=3)
 
         cmd = self._build_cmd()
         if cmd is None:
@@ -475,42 +492,67 @@ class _AppProcess:
     def stop(self) -> None:
         """Terminate gracefully, then wait for the thread."""
         self._stop_proc()
-        if self._thread:
+        if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
-            if self._thread.is_alive():
-                log.warn("[watch] Thread still alive after stop — force-killing")
-                with self._lock:
-                    proc = self._proc
-                if proc:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+        if self._thread and self._thread.is_alive():
+            log.warn("[watch] Thread still alive after stop — force-killing")
+            with self._lock:
+                proc = self._proc
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            # Final wait — give the thread up to 3 s to notice the kill
+            self._thread.join(timeout=3)
 
     def is_alive(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def _stop_proc(self, *, timeout_term: float = 3.0) -> None:
+    def _stop_proc(self, *, timeout_term: float = 5.0) -> None:
         """
         Send SIGTERM; if the process hasn't exited within *timeout_term*
         seconds escalate to SIGKILL so the caller never blocks indefinitely.
+        Uses a busy-poll instead of proc.wait() to avoid the thread hanging
+        on zombie processes or blocked pipes.
         """
         with self._lock:
             proc = self._proc
         if proc is None or proc.poll() is not None:
             return
+        # Signal the process group so child threads also get the signal
         try:
-            proc.send_signal(signal.SIGTERM)
-            proc.wait(timeout=timeout_term)
-        except subprocess.TimeoutExpired:
-            log.warn("[watch] Process did not stop on SIGTERM — sending SIGKILL")
+            import os
             try:
-                proc.kill()
-                proc.wait(timeout=3.0)
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except Exception:
-                pass
+                proc.send_signal(signal.SIGTERM)
         except Exception:
             pass
+
+        # Busy-poll until TERM is handled or we escalate
+        deadline = time.monotonic() + timeout_term
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                return
+            time.sleep(0.1)
+
+        log.warn("[watch] Process did not stop on SIGTERM — sending SIGKILL")
+        try:
+            import os
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+        except Exception:
+            pass
+
+        # Final busy-poll after SIGKILL — hard cap 3 s
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                return
+            time.sleep(0.1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -759,6 +801,7 @@ def watch_and_run(
         except Exception:
             pass
         # Hard deadline: if app.stop() hangs, force-kill after 6 s total.
+        import os as _os
         t0 = time.time()
         stop_thread = threading.Thread(target=app.stop, daemon=True, name="stop")
         stop_thread.start()
@@ -772,6 +815,11 @@ def watch_and_run(
                     proc.kill()
                 except Exception:
                     pass
+            # Give the kill one more second, then hard-exit so we never hang
+            stop_thread.join(timeout=1)
+            if stop_thread.is_alive():
+                log.warn("[watch] Hard exit — process would not die cleanly.")
+                _os._exit(0)
         log.info(f"[watch] Done. ({time.time() - t0:.1f}s)")
 
     return True
